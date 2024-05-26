@@ -36,4 +36,4 @@
 # isn't shallow!
 [submodule "3rdparty/hamt"]
 	path = 3rdparty/hamt
-	url = https://github.com/cognominal/hamt-for-raku-moarvm
+	url = https://github.com/cognominal/MoarVM-hamt
