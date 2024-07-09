@@ -44,6 +44,7 @@ CINCLUDES = @moar_cincludes@ \
             @ccincsystem@3rdparty/ryu \
             @ccincsystem@3rdparty/dynasm \
             @ccincsystem@3rdparty/cmp \
+            @ccincsystem@3rdparty/hamt/include \
             @ccincsystem@3rdparty \
             @cincludes@ \
             @ccinc@src

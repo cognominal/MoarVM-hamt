@@ -1,0 +1,19 @@
+{
+    "C_Cpp.default.compilerPath": "/usr/bin/clang",
+    "files.associations": {
+        "*.raku": "raku",
+        "*.in": "makefile",
+        "bitset": "c",
+        "words.h": "c",
+        "assert.h": "c",
+        "cstdio": "c",
+        "string": "c",
+        "string_view": "c",
+        "limits.h": "c",
+        "map": "c",
+        "set": "c",
+        "unordered_map": "c",
+        "telemeh.h": "c",
+        "__hash_table": "c"
+    }
+}

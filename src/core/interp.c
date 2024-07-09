@@ -1,6 +1,9 @@
 #include "moar.h"
 #include "platform/time.h"
 #include "platform/sys.h"
+#include "hamt.h"
+/* TBD other 3rdparty headers are not exposed here. how ? Probably non 3rdparty files propose an adapter to 3rparty API
+*/
 
 /* Macros for getting things from the bytecode stream. */
 #if MVM_GC_DEBUG >= 2
@@ -5565,6 +5568,12 @@ void MVM_interp_run(MVMThreadContext *tc, void (*initial_invoke)(MVMThreadContex
                 MVMuint32 idx = (MVMuint32)GET_REG(cur_op, 4).i64;
                 GET_REG(cur_op, 0).u64 = MVM_capture_arg_pos_u(tc, obj, idx);
                 cur_op += 6;
+                goto NEXT;
+            }
+            OP(persist): {
+                MVMObject *obj = GET_REG(cur_op, 2).o;
+                hamt *trie = ((PersistableHash*) obj)->body.trie;
+                ((PersistableHash*)GET_REG(cur_op, 0).o)->body.trie  = hamt_make_trie_persistent(trie);
                 goto NEXT;
             }
             OP(sp_guard): {

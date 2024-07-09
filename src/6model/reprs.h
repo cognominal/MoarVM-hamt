@@ -46,6 +46,7 @@
 #include "6model/reprs/MVMSpeshCandidate.h"
 #include "6model/reprs/MVMTracked.h"
 #include "6model/reprs/MVMStat.h"
+#include "6model/reprs/HamtHash.h"
 
 /* REPR related functions. */
 void MVM_repr_initialize_registry(MVMThreadContext *tc);
@@ -102,8 +103,9 @@ const MVMREPROps * MVM_repr_get_by_name(MVMThreadContext *tc, MVMString *name);
 #define MVM_REPR_ID_MVMCapture              44
 #define MVM_REPR_ID_MVMTracked              45
 #define MVM_REPR_ID_MVMStat                 46
+#define MVM_REPR_ID_PersistentHash          47
 
-#define MVM_REPR_CORE_COUNT                 47
+#define MVM_REPR_CORE_COUNT                 48
 #define MVM_REPR_MAX_COUNT                  64
 
 /* Default attribute functions for a REPR that lacks them. */

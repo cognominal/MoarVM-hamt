@@ -1,3 +1,5 @@
+#ifndef SIXMODEL_H__
+#define SIXMODEL_H__
 /* Boolification mode flags. */
 #define MVM_BOOL_MODE_CALL_METHOD                   0
 #define MVM_BOOL_MODE_UNBOX_INT                     1
@@ -158,7 +160,10 @@ typedef enum {
 
     /* Has this item been chained into a gen2 freelist? This is only used in
      * GC debug more. */
-    MVM_CF_DEBUG_IN_GEN2_FREE_LIST = 64
+    MVM_CF_DEBUG_IN_GEN2_FREE_LIST = 64,
+#ifdef HAMT_REF_COUNTED
+    MVM_CF_REF_COUNTED = 128
+#endif
 } MVMCollectableFlags2;
 
 #ifdef MVM_USE_OVERFLOW_SERIALIZATION_INDEX
@@ -693,3 +698,5 @@ MVM_STATIC_INLINE char *MVM_6model_get_stable_debug_name(MVMThreadContext *tc, M
     return stable->debug_name ? stable->debug_name : "";
 }
 void MVM_6model_set_debug_name(MVMThreadContext *tc, MVMObject *type, MVMString *name);
+
+#endif

@@ -1,3 +1,5 @@
+#ifndef _MOAR_H__
+#define _MOAR_H__
 /* Configuration. */
 #include "gen/config.h"
 
@@ -393,4 +395,5 @@ AO_t AO_fetch_compare_and_swap_emulation(volatile AO_t *addr, AO_t old_val, AO_t
 #define MVM_store(addr, new) AO_store_full((volatile AO_t *)(addr), (AO_t)(new))
 #define MVM_load(addr) AO_load_full((volatile AO_t *)(addr))
 
+#endif
 #endif

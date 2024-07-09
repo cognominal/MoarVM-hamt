@@ -1,14 +1,29 @@
 {
     "env": {
-        "envDefines": [ "HAMT_HYBRID" ]        
+        "PersistableDefines" : [ "HAMT_PERSISTABLE", "HAMT_CONTEXTUAL"],
+        "NonPersistableDefines" : []
+
     },
     "configurations": [
+        {
+            "name": "Mac-Persistable",
+            "includePath": [
+                "${workspaceFolder}/**"
+            ],
+            "defines": ["${PersistableDefines}"],
+            "macFrameworkPath": [
+                "/Library/Developer/CommandLineTools/SDKs/MacOSX.sdk/System/Library/Frameworks"
+            ],
+            "cStandard": "c17",
+            "cppStandard": "c++17",
+            "intelliSenseMode": "macos-clang-arm64"
+        },
         {
             "name": "Mac",
             "includePath": [
                 "${workspaceFolder}/**"
             ],
-            "defines": ["${envDefines}"],
+            "defines": [],
             "macFrameworkPath": [
                 "/Library/Developer/CommandLineTools/SDKs/MacOSX.sdk/System/Library/Frameworks"
             ],
@@ -16,6 +31,7 @@
             "cppStandard": "c++17",
             "intelliSenseMode": "macos-clang-arm64"
         }
+
     ],
     "version": 4
 }

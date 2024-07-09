@@ -1,0 +1,239 @@
+{
+	"files": [
+		{
+			"path": "Configure.pl",
+			"bookmarks": [
+				{
+					"line": 705,
+					"column": 30,
+					"label": ""
+				},
+				{
+					"line": 970,
+					"column": 41,
+					"label": ""
+				}
+			]
+		},
+		{
+			"path": "src/gc/collect.c",
+			"bookmarks": [
+				{
+					"line": 348,
+					"column": 30,
+					"label": ""
+				}
+			]
+		},
+		{
+			"path": "src/6model/reprs/VMArray.c",
+			"bookmarks": [
+				{
+					"line": 67,
+					"column": 4,
+					"label": ""
+				},
+				{
+					"line": 1331,
+					"column": 31,
+					"label": ""
+				},
+				{
+					"line": 1550,
+					"column": 27,
+					"label": ""
+				}
+			]
+		},
+		{
+			"path": "3rdparty/hamt/src/hamt.c",
+			"bookmarks": [
+				{
+					"line": 16,
+					"column": 18,
+					"label": ""
+				},
+				{
+					"line": 275,
+					"column": 17,
+					"label": ""
+				},
+				{
+					"line": 562,
+					"column": 6,
+					"label": ""
+				},
+				{
+					"line": 874,
+					"column": 9,
+					"label": ""
+				}
+			]
+		},
+		{
+			"path": "3rdparty/hamt/test/test_hamt.c",
+			"bookmarks": [
+				{
+					"line": 68,
+					"column": 21,
+					"label": ""
+				},
+				{
+					"line": 133,
+					"column": 37,
+					"label": ""
+				},
+				{
+					"line": 906,
+					"column": 25,
+					"label": ""
+				},
+				{
+					"line": 1299,
+					"column": 22,
+					"label": ""
+				}
+			]
+		},
+		{
+			"path": "src/6model/reprs/HamtHash.c",
+			"bookmarks": [
+				{
+					"line": 117,
+					"column": 55,
+					"label": ""
+				},
+				{
+					"line": 127,
+					"column": 24,
+					"label": ""
+				},
+				{
+					"line": 146,
+					"column": 14,
+					"label": ""
+				},
+				{
+					"line": 270,
+					"column": 14,
+					"label": ""
+				}
+			]
+		},
+		{
+			"path": "3rdparty/hamt/HAMT-for-MoarVM.md",
+			"bookmarks": [
+				{
+					"line": 180,
+					"column": 0,
+					"label": ""
+				}
+			]
+		},
+		{
+			"path": "src/6model/reprs/HashAttrStore.c",
+			"bookmarks": [
+				{
+					"line": 184,
+					"column": 31,
+					"label": ""
+				}
+			]
+		},
+		{
+			"path": "src/6model/reprs/MVMHash.c",
+			"bookmarks": [
+				{
+					"line": 101,
+					"column": 45,
+					"label": ""
+				},
+				{
+					"line": 272,
+					"column": 26,
+					"label": ""
+				}
+			]
+		},
+		{
+			"path": "src/6model/reprs.c",
+			"bookmarks": [
+				{
+					"line": 292,
+					"column": 33,
+					"label": ""
+				}
+			]
+		},
+		{
+			"path": "src/6model/reprs/P6int.c",
+			"bookmarks": [
+				{
+					"line": 200,
+					"column": 22,
+					"label": ""
+				}
+			]
+		},
+		{
+			"path": "src/6model/reprs/HamtHash.h",
+			"bookmarks": [
+				{
+					"line": 15,
+					"column": 7,
+					"label": ""
+				}
+			]
+		},
+		{
+			"path": "src/gc/roots.h",
+			"bookmarks": [
+				{
+					"line": 67,
+					"column": 13,
+					"label": ""
+				}
+			]
+		},
+		{
+			"path": "src/strings/ops.c",
+			"bookmarks": [
+				{
+					"line": 1459,
+					"column": 9,
+					"label": ""
+				}
+			]
+		},
+		{
+			"path": "src/core/interp.c",
+			"bookmarks": [
+				{
+					"line": 5572,
+					"column": 17,
+					"label": ""
+				}
+			]
+		},
+		{
+			"path": "src/core/oplist",
+			"bookmarks": [
+				{
+					"line": 895,
+					"column": 20,
+					"label": ""
+				}
+			]
+		},
+		{
+			"path": ".vscode/c_cpp_properties.json",
+			"bookmarks": [
+				{
+					"line": 8,
+					"column": 31,
+					"label": ""
+				}
+			]
+		}
+	]
+}
