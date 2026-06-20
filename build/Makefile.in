@@ -64,8 +64,9 @@ PLATFORM_POSIX = src/platform/posix/mmap@obj@ \
                  src/platform/posix/fork@obj@
 
 DASM_FLAGS   = @dasm_flags@
-JIT_ARCH_X64 = src/jit/x64/emit@obj@ src/jit/x64/arch@obj@
-JIT_STUB     = src/jit/stub@obj@
+JIT_ARCH_X64   = src/jit/x64/emit@obj@ src/jit/x64/arch@obj@
+JIT_ARCH_ARM64 = src/jit/arm64/emit@obj@ src/jit/arm64/arch@obj@
+JIT_STUB       = src/jit/stub@obj@
 JIT_OBJECTS  = src/jit/graph@obj@ \
                src/jit/label@obj@ \
                src/jit/compile@obj@ \
@@ -79,6 +80,7 @@ JIT_OBJECTS  = src/jit/graph@obj@ \
 # JIT intermediate files which clean should remove
 JIT_INTERMEDIATES = src/jit/x64/emit.c \
                     src/jit/x64/tile_pattern.h \
+                    src/jit/arm64/emit.c \
                     src/jit/core_templates.h
 
 JIT_PERL_LIBS = tools/lib/sexpr.pm tools/lib/expr_ops.pm tools/lib/oplist.pm
@@ -682,6 +684,10 @@ src/jit/x64/emit@obj@: src/jit/x64/emit.c $(DYNASM_HEADERS)
 
 src/jit/x64/emit.c: src/jit/x64/emit.dasc src/jit/x64/tiles.dasc $(MINILUA) $(DYNASM_SCRIPTS)
 
+src/jit/arm64/emit@obj@: src/jit/arm64/emit.c $(DYNASM_HEADERS) 3rdparty/dynasm/dasm_arm64.h
+
+src/jit/arm64/emit.c: src/jit/arm64/emit.dasc $(MINILUA) 3rdparty/dynasm/dynasm.lua 3rdparty/dynasm/dasm_arm64.lua
+
 # Expression list tables
 src/jit/core_templates.h: src/jit/core_templates.expr src/jit/macro.expr \
     src/core/oplist src/jit/expr_ops.h \
@@ -695,10 +701,19 @@ src/jit/expr@obj@: src/jit/core_templates.h
 src/jit/tile@obj@: src/jit/x64/tile_pattern.h
 
 src/jit/compile@obj@ src/jit/linear_scan@obj@ src/jit/x64/arch@obj@ @jit_obj@: src/jit/internal.h src/jit/x64/arch.h
+src/jit/arm64/arch@obj@: src/jit/internal.h src/jit/arm64/arch.h
 
 tools/repr_size_table@exe@: tools/repr_size_table@obj@ @moarlib@ $(DLL_LIBS)
 	$(MSG) Building $@
 	$(CMD)$(LD) @ldout@$@ $(LDFLAGS) $(MINGW_UNICODE) $< @moarlib@ $(DLL_LIBS)
+
+t/jit_arm64_frame@exe@: t/jit_arm64_frame@obj@ @moarlib@
+	$(MSG) Building $@
+	$(CMD)$(LD) @ldout@$@ $(LDFLAGS) $(MINGW_UNICODE) $< @moarlib@ $(DLL_LIBS)
+
+test-jit-arm64: t/jit_arm64_frame@exe@
+	$(MSG) Running ARM64 JIT frame test
+	$(CMD)./t/jit_arm64_frame@exe@
 
 
 @uvlib@: $(UV_OBJECTS)

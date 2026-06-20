@@ -6,7 +6,7 @@
 	url = https://github.com/MoarVM/dyncall.git
 [submodule "3rdparty/dynasm"]
 	path = 3rdparty/dynasm
-	url = https://github.com/MoarVM/dynasm.git
+	url = https://github.com/cognominal/dynasm.git
 [submodule "3rdparty/libtommath"]
 	path = 3rdparty/libtommath
 	url = https://github.com/MoarVM/libtommath

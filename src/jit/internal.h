@@ -71,12 +71,17 @@ void MVM_jit_spill_memory_release(MVMThreadContext *tc, MVMJitCompiler *compiler
 
 /* Although we use these only symbolically, we need to assign a temporary value
  * in order to to distinguish between them */
-#define MVM_JIT_ARCH_X64 1
+#define MVM_JIT_ARCH_X64   1
+#define MVM_JIT_ARCH_ARM64 2
 #define MVM_JIT_PLATFORM_POSIX 1
 #define MVM_JIT_PLATFORM_WIN32 2
 
 #if MVM_JIT_ARCH == MVM_JIT_ARCH_X64
-#define MVM_JIT_ARCH_H "jit/x64/arch.h"
+#define MVM_JIT_ARCH_H          "jit/x64/arch.h"
+#define MVM_JIT_TILE_PATTERN_H  "jit/x64/tile_pattern.h"
+#elif MVM_JIT_ARCH == MVM_JIT_ARCH_ARM64
+#define MVM_JIT_ARCH_H          "jit/arm64/arch.h"
+#define MVM_JIT_TILE_PATTERN_H  "jit/arm64/tile_pattern.h"
 #endif
 
 /* Depends on values of MVM_JIT_PLATFORM, so need to be defined, but uses the
@@ -86,6 +91,7 @@ void MVM_jit_spill_memory_release(MVMThreadContext *tc, MVMJitCompiler *compiler
 #endif
 
 #undef MVM_JIT_ARCH_X64
+#undef MVM_JIT_ARCH_ARM64
 #undef MVM_JIT_PLATFORM_POSIX
 #undef MVM_JIT_PLATFORM_WIN32
 

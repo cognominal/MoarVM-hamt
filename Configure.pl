@@ -645,12 +645,10 @@ if ($args{'jit'}) {
             $config{jit_arch}     = 'MVM_JIT_ARCH_X64';
             $config{jit_platform} = 'MVM_JIT_PLATFORM_POSIX';
         } else {
-            print "JIT isn't supported on $Config{archname} ARM64 yet.\n";
-# future support of ARM64 JITting
-#            $config{jit_obj}      = '$(JIT_OBJECTS) $(JIT_ARCH_)';
-#            $config{dasm_flags}   = '-D POSIX=1';
-#            $config{jit_arch}     = 'MVM_JIT_ARCH_ARM64';
-#            $config{jit_platform} = 'MVM_JIT_PLATFORM_POSIX';
+            $config{jit_obj}      = '$(JIT_OBJECTS) $(JIT_ARCH_ARM64)';
+            $config{dasm_flags}   = '-D POSIX=1';
+            $config{jit_arch}     = 'MVM_JIT_ARCH_ARM64';
+            $config{jit_platform} = 'MVM_JIT_PLATFORM_POSIX';
         }
 
     } elsif ($archname =~ /^MSWin32-x64/) {

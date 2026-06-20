@@ -1,8 +1,8 @@
 #include "moar.h"
 #include "internal.h"
 
-#if MVM_JIT_ARCH == MVM_JIT_ARCH_X64
-#include "jit/x64/tile_pattern.h"
+#ifdef MVM_JIT_TILE_PATTERN_H
+#include MVM_JIT_TILE_PATTERN_H
 #endif
 
 
