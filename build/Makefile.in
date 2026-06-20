@@ -711,9 +711,15 @@ t/jit_arm64_frame@exe@: t/jit_arm64_frame@obj@ @moarlib@
 	$(MSG) Building $@
 	$(CMD)$(LD) @ldout@$@ $(LDFLAGS) $(MINGW_UNICODE) $< @moarlib@ $(DLL_LIBS)
 
-test-jit-arm64: t/jit_arm64_frame@exe@
+t/jit_arm64_call@exe@: t/jit_arm64_call@obj@ @moarlib@
+	$(MSG) Building $@
+	$(CMD)$(LD) @ldout@$@ $(LDFLAGS) $(MINGW_UNICODE) $< @moarlib@ $(DLL_LIBS)
+
+test-jit-arm64: t/jit_arm64_frame@exe@ t/jit_arm64_call@exe@
 	$(MSG) Running ARM64 JIT frame test
 	$(CMD)./t/jit_arm64_frame@exe@
+	$(MSG) Running ARM64 JIT call_c test
+	$(CMD)./t/jit_arm64_call@exe@
 
 
 @uvlib@: $(UV_OBJECTS)

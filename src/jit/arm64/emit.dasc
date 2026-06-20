@@ -10,12 +10,18 @@
 
 /* Typed register aliases — binds C struct type to a base register.
  * Field access TC->foo expands to [x19, #offsetof(MVMThreadContext, foo)]. */
-|.type TC,   MVMThreadContext, x19
-|.type WORK, MVMRegister,      x21
-|.type CU,   MVMCompUnit,      x20
-|.type FRAME, MVMFrame
-|.type OBJECT, MVMObject
-|.type STABLE, MVMSTable
+|.type TC,         MVMThreadContext, x19
+|.type WORK,       MVMRegister,      x21
+|.type CU,         MVMCompUnit,      x20
+|.type FRAME,      MVMFrame
+|.type OBJECT,     MVMObject
+|.type STABLE,     MVMSTable
+|.type STOOGE,     MVMObjectStooge
+|.type VMARRAY,    MVMArray
+|.type CARRAY,     MVMCArray
+|.type MVMINSTANCE, MVMInstance
+|.type STATICFRAME, MVMStaticFrame
+|.type OBJECTPTR,  MVMObject*
 
 /* ---- Register conventions ------------------------------------------------
  * x0-x7  : ARG1-ARG8 / caller-saved
@@ -71,6 +77,28 @@
 | mov ARG1, x19
 | callp &MVM_gc_enter_from_interrupt
 |1:
+|.endmacro
+
+|.macro get_spesh_slot, reg, idx
+| ldr reg, TC->cur_frame
+| ldr reg, FRAME:reg->effective_spesh_slots
+| ldr reg, [reg, #((idx)*8)]
+|.endmacro
+
+|.macro get_vmnull, reg
+| ldr reg, TC->instance
+| ldr reg, MVMINSTANCE:reg->VMNull
+|.endmacro
+
+|.macro get_cur_op, reg
+| ldr reg, TC->interp_cur_op
+| ldr reg, [reg]
+|.endmacro
+
+|.macro get_string, reg, idx
+|| MVM_cu_ensure_string_decoded(tc, jg->sg->sf->body.cu, idx);
+| ldr reg, CU->body.strings
+| ldr reg, [reg, #((idx)*8)]
 |.endmacro
 
 
@@ -161,6 +189,243 @@ void MVM_jit_emit_all_bb_jumps(MVMThreadContext *tc, MVMJitCompiler *compiler,
     MVM_oops(tc, "ARM64 JIT: emit_all_bb_jumps not yet implemented");
 }
 
+/* ---- emit_call_c helpers ------------------------------------------------ */
+
+static void load_call_arg(MVMThreadContext *tc, MVMJitCompiler *compiler,
+                          MVMJitGraph *jg, MVMJitCallArg arg) {
+    switch (arg.type) {
+    case MVM_JIT_INTERP_VAR:
+        switch (arg.v.ivar) {
+        case MVM_JIT_INTERP_TC:
+            | mov TMP6, x19
+            break;
+        case MVM_JIT_INTERP_CU:
+            | mov TMP6, x20
+            break;
+        case MVM_JIT_INTERP_FRAME:
+            | ldr TMP6, TC->cur_frame
+            break;
+        case MVM_JIT_INTERP_PARAMS:
+            | ldr TMP6, TC->cur_frame
+            | add TMP6, TMP6, #offsetof(MVMFrame, params)
+            break;
+        case MVM_JIT_INTERP_CALLER:
+            | ldr TMP6, TC->cur_frame
+            | ldr TMP6, FRAME:TMP6->caller
+            break;
+        }
+        break;
+    case MVM_JIT_REG_VAL:
+    case MVM_JIT_REG_VAL_F: {
+        MVMint32 offset = arg.v.reg * sizeof(MVMRegister);
+        | ldr TMP6, [x21, #offset]
+        break;
+    }
+    case MVM_JIT_REG_ADDR: {
+        MVMint32 offset = arg.v.reg * sizeof(MVMRegister);
+        | add TMP6, x21, #offset
+        break;
+    }
+    case MVM_JIT_STR_IDX:
+        | get_string TMP6, arg.v.lit_i64
+        break;
+    case MVM_JIT_LITERAL:
+    case MVM_JIT_LITERAL_64:
+    case MVM_JIT_LITERAL_PTR:
+    case MVM_JIT_LITERAL_F:
+        | .data
+        | 6:
+        | .quad (uintptr_t)(arg.v.lit_i64)
+        | .code
+        | ldr TMP6, <6
+        break;
+    case MVM_JIT_REG_STABLE: {
+        MVMint32 offset = arg.v.reg * sizeof(MVMRegister);
+        | ldr TMP6, [x21, #offset]
+        | ldr TMP6, OBJECT:TMP6->st
+        break;
+    }
+    case MVM_JIT_REG_OBJBODY: {
+        MVMint32 offset = arg.v.reg * sizeof(MVMRegister);
+        | ldr TMP6, [x21, #offset]
+        | add TMP6, TMP6, #offsetof(MVMObjectStooge, data)
+        break;
+    }
+    case MVM_JIT_REG_DYNIDX:
+        | get_cur_op TMP6
+        | ldrh w14, [x14, #(arg.v.reg * 2)]
+        | ldr x14, [x21, x14, lsl #3]
+        break;
+    case MVM_JIT_DATA_LABEL:
+        | adr TMP6, =>(arg.v.lit_i64)
+        break;
+    case MVM_JIT_ARG_I64:
+    case MVM_JIT_PARAM_I64: {
+        MVMint32 offset = (MVMint32)(arg.v.lit_i64 * sizeof(MVMRegister));
+        | ldr TMP6, [x21, #offset]
+        break;
+    }
+    case MVM_JIT_ARG_I64_RW:
+    case MVM_JIT_PARAM_I64_RW: {
+        MVMint32 offset = (MVMint32)(arg.v.lit_i64 * sizeof(MVMRegister));
+        | add TMP6, x21, #offset
+        break;
+    }
+    case MVM_JIT_ARG_DOUBLE:
+    case MVM_JIT_PARAM_DOUBLE: {
+        MVMint32 offset = (MVMint32)(arg.v.lit_i64 * sizeof(MVMRegister));
+        | ldr TMP6, [x21, #offset]
+        break;
+    }
+    case MVM_JIT_ARG_PTR:
+    case MVM_JIT_PARAM_PTR: {
+        MVMint32 offset = (MVMint32)(arg.v.lit_i64 * sizeof(MVMRegister));
+        | ldr TMP6, [x21, #offset]
+        | ldr TMP6, STOOGE:TMP6->data
+        break;
+    }
+    case MVM_JIT_ARG_VMARRAY:
+    case MVM_JIT_PARAM_VMARRAY: {
+        MVMint32 offset = (MVMint32)(arg.v.lit_i64 * sizeof(MVMRegister));
+        | ldr TMP6, [x21, #offset]
+        | ldr TMP6, VMARRAY:TMP6->body.slots
+        break;
+    }
+    case MVM_JIT_PARAM_CARRAY: {
+        MVMint32 offset = (MVMint32)(arg.v.lit_i64 * sizeof(MVMRegister));
+        | ldr TMP6, [x21, #offset]
+        | ldr TMP6, CARRAY:TMP6->body.storage
+        break;
+    }
+    case MVM_JIT_SPESH_SLOT_VALUE:
+        | get_spesh_slot TMP6, arg.v.lit_i64
+        break;
+    case MVM_JIT_STACK_VALUE: {
+        MVMint32 offset = 40 + (MVMint32)(arg.v.lit_i64 * 8);
+        | ldr TMP6, [x29, #offset]
+        break;
+    }
+    default:
+        MVM_oops(tc, "ARM64 JIT: unknown call arg type %d", arg.type);
+    }
+}
+
+static void emit_gpr_arg(MVMThreadContext *tc, MVMJitCompiler *compiler, MVMint32 i) {
+    switch (i) {
+    case 0:
+        | mov ARG1, TMP6
+        break;
+    case 1:
+        | mov ARG2, TMP6
+        break;
+    case 2:
+        | mov ARG3, TMP6
+        break;
+    case 3:
+        | mov ARG4, TMP6
+        break;
+    case 4:
+        | mov ARG5, TMP6
+        break;
+    case 5:
+        | mov ARG6, TMP6
+        break;
+    case 6:
+        | mov x6, TMP6
+        break;
+    case 7:
+        | mov x7, TMP6
+        break;
+    default:
+        MVM_oops(tc, "ARM64 JIT: too many GPR call args (%d)", i);
+    }
+}
+
+static void emit_fpr_arg(MVMThreadContext *tc, MVMJitCompiler *compiler, MVMint32 i) {
+    switch (i) {
+    case 0:
+        | fmov d0, x14
+        break;
+    case 1:
+        | fmov d1, x14
+        break;
+    case 2:
+        | fmov d2, x14
+        break;
+    case 3:
+        | fmov d3, x14
+        break;
+    case 4:
+        | fmov d4, x14
+        break;
+    case 5:
+        | fmov d5, x14
+        break;
+    case 6:
+        | fmov d6, x14
+        break;
+    case 7:
+        | fmov d7, x14
+        break;
+    default:
+        MVM_oops(tc, "ARM64 JIT: too many FPR call args (%d)", i);
+    }
+}
+
+static void emit_arm64_callargs(MVMThreadContext *tc, MVMJitCompiler *compiler,
+                                MVMJitGraph *jg, MVMJitCallArg args[], MVMint32 num_args) {
+    MVMint32 num_gpr = 0, num_fpr = 0, i;
+    MVMJitCallArg in_gpr[8], in_fpr[8];
+
+    for (i = 0; i < num_args; i++) {
+        switch (args[i].type) {
+        case MVM_JIT_INTERP_VAR:
+        case MVM_JIT_REG_VAL:
+        case MVM_JIT_REG_ADDR:
+        case MVM_JIT_REG_OBJBODY:
+        case MVM_JIT_REG_STABLE:
+        case MVM_JIT_REG_DYNIDX:
+        case MVM_JIT_STR_IDX:
+        case MVM_JIT_LITERAL:
+        case MVM_JIT_LITERAL_64:
+        case MVM_JIT_LITERAL_PTR:
+        case MVM_JIT_DATA_LABEL:
+        case MVM_JIT_ARG_I64:
+        case MVM_JIT_ARG_I64_RW:
+        case MVM_JIT_ARG_PTR:
+        case MVM_JIT_ARG_VMARRAY:
+        case MVM_JIT_PARAM_I64:
+        case MVM_JIT_PARAM_I64_RW:
+        case MVM_JIT_PARAM_PTR:
+        case MVM_JIT_PARAM_VMARRAY:
+        case MVM_JIT_PARAM_CARRAY:
+        case MVM_JIT_SPESH_SLOT_VALUE:
+        case MVM_JIT_STACK_VALUE:
+            if (num_gpr < 8) in_gpr[num_gpr++] = args[i];
+            else MVM_oops(tc, "ARM64 JIT: too many GPR arguments");
+            break;
+        case MVM_JIT_ARG_DOUBLE:
+        case MVM_JIT_PARAM_DOUBLE:
+        case MVM_JIT_REG_VAL_F:
+        case MVM_JIT_LITERAL_F:
+            if (num_fpr < 8) in_fpr[num_fpr++] = args[i];
+            else MVM_oops(tc, "ARM64 JIT: too many FPR arguments");
+            break;
+        default:
+            MVM_oops(tc, "ARM64 JIT: unknown arg type %d in callargs", args[i].type);
+        }
+    }
+
+    for (i = 0; i < num_gpr; i++) {
+        load_call_arg(tc, compiler, jg, in_gpr[i]);
+        emit_gpr_arg(tc, compiler, i);
+    }
+    for (i = 0; i < num_fpr; i++) {
+        load_call_arg(tc, compiler, jg, in_fpr[i]);
+        emit_fpr_arg(tc, compiler, i);
+    }
+}
+
 /* ---- Stubs for unimplemented emitters ----------------------------------- */
 
 void MVM_jit_emit_primitive(MVMThreadContext *tc, MVMJitCompiler *compiler,
@@ -170,7 +435,63 @@ void MVM_jit_emit_primitive(MVMThreadContext *tc, MVMJitCompiler *compiler,
 
 void MVM_jit_emit_call_c(MVMThreadContext *tc, MVMJitCompiler *compiler,
                          MVMJitGraph *jg, MVMJitCallC *call_spec) {
-    MVM_oops(tc, "ARM64 JIT: emit_call_c not yet implemented");
+    emit_arm64_callargs(tc, compiler, jg, call_spec->args, call_spec->num_args);
+    | callp call_spec->func_ptr
+
+    switch (call_spec->rv_mode) {
+    case MVM_JIT_RV_VOID:
+        break;
+    case MVM_JIT_RV_INT:
+    case MVM_JIT_RV_PTR: {
+        MVMint32 offset = call_spec->rv_idx * (MVMint32)sizeof(MVMRegister);
+        | str RV, [x21, #offset]
+        break;
+    }
+    case MVM_JIT_RV_INT_NEGATED: {
+        MVMint32 offset = call_spec->rv_idx * (MVMint32)sizeof(MVMRegister);
+        | cmp RV, #0
+        | cset TMP2, eq
+        | str TMP2, [x21, #offset]
+        break;
+    }
+    case MVM_JIT_RV_NUM: {
+        MVMint32 offset = call_spec->rv_idx * (MVMint32)sizeof(MVMRegister);
+        | str d0, [x21, #offset]
+        break;
+    }
+    case MVM_JIT_RV_DEREF: {
+        MVMint32 offset = call_spec->rv_idx * (MVMint32)sizeof(MVMRegister);
+        | ldr TMP1, [RV]
+        | str TMP1, [x21, #offset]
+        break;
+    }
+    case MVM_JIT_RV_ADDR: {
+        MVMint32 offset = call_spec->rv_idx * (MVMint32)sizeof(MVMRegister);
+        | ldr TMP1, [x21, #offset]
+        | str TMP1, [RV]
+        break;
+    }
+    case MVM_JIT_RV_DYNIDX:
+        /* cur_op holds a u16 reg index at position rv_idx */
+        | get_cur_op TMP2
+        | ldrh w10, [x10, #(call_spec->rv_idx * 2)]
+        | str RV, [x21, x10, lsl #3]
+        break;
+    case MVM_JIT_RV_DEREF_OR_VMNULL: {
+        MVMint32 offset = call_spec->rv_idx * (MVMint32)sizeof(MVMRegister);
+        | cbz RV, >4
+        | ldr TMP1, [RV]
+        | b >5
+        |4:
+        | get_vmnull TMP1
+        |5:
+        | str TMP1, [x21, #offset]
+        break;
+    }
+    case MVM_JIT_RV_TO_STACK:
+        MVM_oops(tc, "ARM64 JIT: RV_TO_STACK not yet implemented");
+        break;
+    }
 }
 
 void MVM_jit_emit_conditional_branch(MVMThreadContext *tc, MVMJitCompiler *compiler,
