@@ -22,6 +22,11 @@
 |.type MVMINSTANCE, MVMInstance
 |.type STATICFRAME, MVMStaticFrame
 |.type OBJECTPTR,  MVMObject*
+|.type CODE,       MVMCode
+|.type CFUNCTION,  MVMCFunction
+|.type REPR,       MVMREPROps
+|.type MVMDISPINLINECACHE, MVMDispInlineCache
+|.type MVMDISPINLINECACHEENTRY, MVMDispInlineCacheEntry
 
 /* ---- Register conventions ------------------------------------------------
  * x0-x7  : ARG1-ARG8 / caller-saved
@@ -99,6 +104,22 @@
 || MVM_cu_ensure_string_decoded(tc, jg->sg->sf->body.cu, idx);
 | ldr reg, CU->body.strings
 | ldr reg, [reg, #((idx)*8)]
+|.endmacro
+
+/* Test if an object is a type object (non-concrete).
+ * After this macro, NZCV is set: b.ne if type object, b.eq if concrete. */
+|.macro test_type_object, reg
+| ldrb w15, OBJECT:reg->header.flags1
+| tst x15, #MVM_CF_TYPE_OBJECT
+|.endmacro
+
+|.macro get_stable, out, in
+| ldr out, OBJECT:in->st
+|.endmacro
+
+|.macro get_repr, out, in
+| get_stable out, in
+| ldr out, STABLE:out->REPR
 |.endmacro
 
 
@@ -186,7 +207,12 @@ void MVM_jit_emit_block_branch(MVMThreadContext *tc, MVMJitCompiler *compiler,
 
 void MVM_jit_emit_all_bb_jumps(MVMThreadContext *tc, MVMJitCompiler *compiler,
                                MVMint32 name) {
-    MVM_oops(tc, "ARM64 JIT: emit_all_bb_jumps not yet implemented");
+    MVMuint32 bbidx;
+    | b >1
+    for (bbidx = 0; bbidx < compiler->graph->sg->num_bbs; bbidx++) {
+        | b =>(bbidx)
+    }
+    |1:
 }
 
 /* ---- emit_call_c helpers ------------------------------------------------ */
@@ -426,6 +452,13 @@ static void emit_arm64_callargs(MVMThreadContext *tc, MVMJitCompiler *compiler,
     }
 }
 
+/* ARM64 register class helpers.
+ * X0-X30 (0-30) are GPRs; V0-V31 (31-62) are FP registers. */
+#define ARM64_IS_GPR(x) ((unsigned)(x) < 31u)
+#define ARM64_IS_FPR(x) ((unsigned)(x) >= 31u)
+#define ARM64_GPR_NUM(x) ((x))
+#define ARM64_FPR_NUM(x) ((x) - 31)
+
 /* ---- Stubs for unimplemented emitters ----------------------------------- */
 
 void MVM_jit_emit_primitive(MVMThreadContext *tc, MVMJitCompiler *compiler,
@@ -497,44 +530,238 @@ void MVM_jit_emit_call_c(MVMThreadContext *tc, MVMJitCompiler *compiler,
 void MVM_jit_emit_conditional_branch(MVMThreadContext *tc, MVMJitCompiler *compiler,
                                      MVMint32 cond, MVMint32 label,
                                      MVMuint8 test_type) {
-    MVM_oops(tc, "ARM64 JIT: emit_conditional_branch not yet implemented");
+    MVMint32 is_float = (test_type == MVM_reg_num32 || test_type == MVM_reg_num64);
+    /* ARM64 condition codes after CMP (integer) or FCMP (float).
+     * For FCMP, NaN produces N=0 Z=0 C=1 V=1; most conditions naturally
+     * exclude NaN except NE which includes it (matching x64 behaviour). */
+    switch (cond) {
+    case MVM_JIT_LT:
+        if (is_float) {
+            /* MI: N=1, which is false for NaN (N=0 after FCMP on NaN) */
+            | bmi =>(label)
+        } else {
+            | blt =>(label)
+        }
+        break;
+    case MVM_JIT_LE:
+        if (is_float) {
+            /* LS: C=0 or Z=1, false for NaN (C=1, Z=0) */
+            | bls =>(label)
+        } else {
+            | ble =>(label)
+        }
+        break;
+    case MVM_JIT_EQ:
+        | beq =>(label)
+        break;
+    case MVM_JIT_NE:
+        /* NE: Z=0; NaN also has Z=0 so NaN branches — same as x64 (jp | jne) */
+        | bne =>(label)
+        break;
+    case MVM_JIT_GE:
+        /* GE: N=V; for FCMP: NaN has N=0,V=1 so N!=V -> false. Safe. */
+        | bge =>(label)
+        break;
+    case MVM_JIT_GT:
+        /* GT: Z=0 and N=V; NaN: N!=V -> false. Safe. */
+        | bgt =>(label)
+        break;
+    case MVM_JIT_NZ:
+        /* NE: Z=0; NaN has Z=0 so branches (NaN is non-zero) */
+        | bne =>(label)
+        break;
+    case MVM_JIT_ZR:
+        /* EQ: Z=1; NaN has Z=0 so does NOT branch. Safe. */
+        | beq =>(label)
+        break;
+    default:
+        abort();
+    }
 }
 
 void MVM_jit_emit_guard(MVMThreadContext *tc, MVMJitCompiler *compiler,
                         MVMJitGraph *jg, MVMJitGuard *guard) {
-    MVM_oops(tc, "ARM64 JIT: emit_guard not yet implemented");
+    MVMint16 op  = guard->ins->info->opcode;
+    MVMint16 obj = guard->ins->operands[op == MVM_OP_sp_guardsf ? 0 : 1].reg.orig;
+    MVMint32 obj_off = obj * (MVMint32)sizeof(MVMRegister);
+
+    /* Load object into TMP1 */
+    | ldr TMP1, [x21, #obj_off]
+
+    /* Load spesh slot value into TMP2 (not needed for some ops) */
+    if (op != MVM_OP_sp_guardjustconc && op != MVM_OP_sp_guardjusttype &&
+            op != MVM_OP_sp_guardnonzero && op != MVM_OP_sp_guardhll &&
+                op != MVM_OP_sp_rebless) {
+        MVMint16 spesh_idx = guard->ins->operands[op == MVM_OP_sp_guardsf ? 1 : 2].lit_i16;
+        | get_spesh_slot TMP2, spesh_idx
+    }
+
+    if (op == MVM_OP_sp_guard) {
+        | cbz TMP1, >1
+        | ldr TMP3, OBJECT:TMP1->st
+        | cmp TMP2, TMP3
+        | bne >1
+    } else if (op == MVM_OP_sp_guardtype) {
+        | cbz TMP1, >1
+        | test_type_object TMP1
+        | beq >1
+        | ldr TMP3, OBJECT:TMP1->st
+        | cmp TMP2, TMP3
+        | bne >1
+    } else if (op == MVM_OP_sp_guardconc) {
+        | cbz TMP1, >1
+        | test_type_object TMP1
+        | bne >1
+        | ldr TMP3, OBJECT:TMP1->st
+        | cmp TMP2, TMP3
+        | bne >1
+    } else if (op == MVM_OP_sp_guardhll) {
+        MVMuint64 hll_val = guard->ins->operands[2].lit_ui64;
+        | .data
+        | 6:
+        | .quad hll_val
+        | .code
+        | ldr TMP2, <6
+        | ldr TMP3, OBJECT:TMP1->st
+        | ldr TMP4, STABLE:TMP3->hll_owner
+        | cmp TMP2, TMP4
+        | bne >1
+    } else if (op == MVM_OP_sp_guardsf) {
+        | ldr TMP3, CODE:TMP1->body.sf
+        | cmp TMP2, TMP3
+        | bne >1
+    } else if (op == MVM_OP_sp_guardobj) {
+        | cmp TMP2, TMP1
+        | bne >1
+    } else if (op == MVM_OP_sp_guardnonzero) {
+        | cbz TMP1, >1
+    } else if (op == MVM_OP_sp_guardnotobj) {
+        | cmp TMP2, TMP1
+        | beq >1
+    } else if (op == MVM_OP_sp_guardjustconc) {
+        | cbz TMP1, >1
+        | test_type_object TMP1
+        | bne >1
+    } else if (op == MVM_OP_sp_guardjusttype) {
+        | cbz TMP1, >1
+        | test_type_object TMP1
+        | beq >1
+    } else if (op == MVM_OP_sp_rebless) {
+        MVM_oops(tc, "ARM64 JIT: sp_rebless guard not yet implemented");
+    }
+
+    /* Guard passed: optionally copy result to destination register */
+    if (op != MVM_OP_sp_guardsf) {
+        MVMint16 dest = guard->ins->operands[0].reg.orig;
+        if (dest != obj) {
+            MVMint32 dst_off = dest * (MVMint32)sizeof(MVMRegister);
+            | str TMP1, [x21, #dst_off]
+        }
+    }
+    | b >2
+    |1:
+    /* Deopt path */
+    | mov ARG1, x19
+    | mov ARG2, #guard->deopt_idx
+    | callp &MVM_spesh_deopt_one
+    | b ->exit
+    |2:
 }
 
 void MVM_jit_emit_jumplist(MVMThreadContext *tc, MVMJitCompiler *compiler,
                            MVMJitGraph *jg, MVMJitJumpList *jumplist) {
-    MVM_oops(tc, "ARM64 JIT: emit_jumplist not yet implemented");
+    MVMint32 i;
+    MVMint32 reg_off = jumplist->reg * (MVMint32)sizeof(MVMRegister);
+    | ldr TMP1, [x21, #reg_off]
+    | cmp TMP1, #0
+    | blt >2
+    | cmp TMP1, #jumplist->num_labels
+    | bge >2
+    /* Compute jump: each entry is one b-instruction = 4 bytes */
+    | lsl TMP2, TMP1, #2
+    | adr TMP3, >1
+    | add TMP2, TMP3, TMP2
+    | br TMP2
+    |.align 4
+    |1:
+    for (i = 0; i < jumplist->num_labels; i++) {
+        |=>(jumplist->in_labels[i]):
+        | b =>(jumplist->out_labels[i])
+    }
+    |2:
 }
 
 void MVM_jit_emit_control(MVMThreadContext *tc, MVMJitCompiler *compiler,
                           MVMJitControl *ctrl, MVMJitTile *tile) {
-    MVM_oops(tc, "ARM64 JIT: emit_control not yet implemented");
+    MVMJitControlType type = (tile != NULL ? (MVMJitControlType)tile->args[0] : ctrl->type);
+    if (type == MVM_JIT_CONTROL_BREAKPOINT) {
+        | brk #0
+    } else {
+        MVM_panic(1, "ARM64 JIT: unknown control code: <%s>", ctrl->ins->info->name);
+    }
 }
 
 void MVM_jit_emit_data(MVMThreadContext *tc, MVMJitCompiler *compiler,
                        MVMJitData *data) {
-    MVM_oops(tc, "ARM64 JIT: emit_data not yet implemented");
+    MVMuint8 *bytes = (MVMuint8 *)data->data;
+    size_t i;
+    | .data
+    | =>(data->label):
+    for (i = 0; i + 4 <= data->size; i += 4) {
+        MVMuint32 packed = (MVMuint32)bytes[i] | ((MVMuint32)bytes[i+1]<<8) | ((MVMuint32)bytes[i+2]<<16) | ((MVMuint32)bytes[i+3]<<24);
+        | .long packed
+    }
+    if (i < data->size) {
+        MVMuint32 tail = 0; size_t j;
+        for (j = 0; j < data->size - i; j++) tail |= ((MVMuint32)bytes[i+j] << (j*8));
+        | .long tail
+    }
+    | .code
 }
 
 void MVM_jit_emit_load(MVMThreadContext *tc, MVMJitCompiler *compiler,
                        MVMint8 reg_dst, MVMJitStorageClass mem_cls,
                        MVMint32 mem_src, MVMint32 size) {
-    MVM_oops(tc, "ARM64 JIT: emit_load not yet implemented");
+    if (mem_cls == MVM_JIT_STORAGE_LOCAL) {
+        if (ARM64_IS_GPR(reg_dst)) {
+            | ldr Rx(ARM64_GPR_NUM(reg_dst)), [x21, #mem_src]
+        } else {
+            | ldr Rd(ARM64_FPR_NUM(reg_dst)), [x21, #mem_src]
+        }
+    } else {
+        MVM_oops(tc, "ARM64 JIT: emit_load: unsupported storage class %d", mem_cls);
+    }
 }
 
 void MVM_jit_emit_store(MVMThreadContext *tc, MVMJitCompiler *compiler,
                         MVMJitStorageClass mem_cls, MVMint32 mem_pos,
                         MVMint8 reg_src, MVMint32 size) {
-    MVM_oops(tc, "ARM64 JIT: emit_store not yet implemented");
+    if (mem_cls == MVM_JIT_STORAGE_LOCAL) {
+        if (ARM64_IS_GPR(reg_src)) {
+            | str Rx(ARM64_GPR_NUM(reg_src)), [x21, #mem_pos]
+        } else {
+            | str Rd(ARM64_FPR_NUM(reg_src)), [x21, #mem_pos]
+        }
+    } else {
+        MVM_oops(tc, "ARM64 JIT: emit_store: unsupported storage class %d", mem_cls);
+    }
 }
 
 void MVM_jit_emit_copy(MVMThreadContext *tc, MVMJitCompiler *compiler,
-                       MVMint8 dst_reg, MVMint8 src_num) {
-    MVM_oops(tc, "ARM64 JIT: emit_copy not yet implemented");
+                       MVMint8 dst_reg, MVMint8 src_reg) {
+    if (ARM64_IS_GPR(dst_reg)) {
+        if (ARM64_IS_GPR(src_reg)) {
+            | mov Rx(ARM64_GPR_NUM(dst_reg)), Rx(ARM64_GPR_NUM(src_reg))
+        } else {
+            | fmov Rx(ARM64_GPR_NUM(dst_reg)), Rd(ARM64_FPR_NUM(src_reg))
+        }
+    } else {
+        if (ARM64_IS_FPR(src_reg)) {
+            | fmov Rd(ARM64_FPR_NUM(dst_reg)), Rd(ARM64_FPR_NUM(src_reg))
+        } else {
+            | fmov Rd(ARM64_FPR_NUM(dst_reg)), Rx(ARM64_GPR_NUM(src_reg))
+        }
+    }
 }
 
 void MVM_jit_emit_marker(MVMThreadContext *tc, MVMJitCompiler *compiler,
@@ -543,30 +770,355 @@ void MVM_jit_emit_marker(MVMThreadContext *tc, MVMJitCompiler *compiler,
 }
 
 void MVM_jit_emit_deopt_check(MVMThreadContext *tc, MVMJitCompiler *compiler) {
-    MVM_oops(tc, "ARM64 JIT: emit_deopt_check not yet implemented");
+    | ldr TMP6, TC->cur_frame
+    | ldr TMP6, FRAME:TMP6->spesh_cand
+    | cbz TMP6, ->exit
 }
 
 void MVM_jit_emit_runbytecode(MVMThreadContext *tc, MVMJitCompiler *compiler,
                               MVMJitGraph *jg, MVMJitRunByteCode *runcode) {
-    MVM_oops(tc, "ARM64 JIT: emit_runbytecode not yet implemented");
+    MVMint16 i;
+    MVMint32 code_off = runcode->code_register * (MVMint32)sizeof(MVMRegister);
+
+    /* Store arg map in data section at label 5 */
+    | .data
+    |5:
+    {
+        MVMuint32 flag_count = runcode->callsite->flag_count;
+        MVMuint32 fi;
+        for (fi = 0; fi + 2 <= flag_count; fi += 2) {
+            MVMuint32 packed = (MVMuint32)(MVMuint16)runcode->map[fi].reg.orig | ((MVMuint32)(MVMuint16)runcode->map[fi+1].reg.orig << 16);
+            | .long packed
+        }
+        if (flag_count & 1) {
+            MVMuint32 last = (MVMuint32)(MVMuint16)runcode->map[flag_count-1].reg.orig;
+            | .long last
+        }
+    }
+    | .code
+
+    /* Set up frame return info */
+    | get_cur_op TMP2
+    | ldr TMP5, TC->cur_frame
+    | str TMP2, FRAME:TMP5->return_address
+    if (sizeof(MVMReturnType) == 1) {
+        | mov TMP2, #runcode->return_type
+        | strb w10, FRAME:TMP5->return_type
+    } else {
+        MVM_panic(1, "JIT: MVMReturnType has unexpected size");
+    }
+    if (runcode->return_type == MVM_RETURN_VOID) {
+        | str xzr, FRAME:TMP5->return_value
+    } else {
+        MVMint32 rv_off = runcode->return_register * (MVMint32)sizeof(MVMRegister);
+        | add TMP2, x21, #rv_off
+        | str TMP2, FRAME:TMP5->return_value
+    }
+
+    /* On AAPCS64 MVMArgs (24 bytes > 16) is passed by hidden pointer.
+     * Allocate 32 bytes on stack (16-byte aligned), fill MVMArgs fields. */
+    | sub sp, sp, #32
+    | .data
+    | 6:
+    | .quad (uintptr_t)(runcode->callsite)
+    | .code
+    | ldr TMP6, <6
+    | str TMP6, [sp]
+    | ldr TMP6, TC->interp_reg_base
+    | ldr TMP6, [TMP6]
+    | str TMP6, [sp, #8]
+    | adr TMP6, <5
+    | str TMP6, [sp, #16]
+
+    | mov ARG1, x19
+    | ldr ARG2, [x21, #code_off]
+    | mov ARG3, sp
+    | mov ARG4, #runcode->spesh_cand
+
+    /* Use label 7 for function pointer to avoid conflict with label 5 (arg map) */
+    | .data
+    | 7:
+    | .quad (uintptr_t)(&MVM_frame_dispatch)
+    | .code
+    | ldr FUNCTION, <7
+    | blr FUNCTION
+    | add sp, sp, #32
 }
 
 void MVM_jit_emit_runccode(MVMThreadContext *tc, MVMJitCompiler *compiler,
                            MVMJitGraph *jg, MVMJitRunCCode *runcode) {
-    MVM_oops(tc, "ARM64 JIT: emit_runccode not yet implemented");
+    MVMint16 i;
+
+    /* Store arg map at label 5 */
+    | .data
+    |5:
+    {
+        MVMuint32 flag_count = runcode->callsite->flag_count;
+        MVMuint32 fi;
+        for (fi = 0; fi + 2 <= flag_count; fi += 2) {
+            MVMuint32 packed = (MVMuint32)(MVMuint16)runcode->map[fi].reg.orig | ((MVMuint32)(MVMuint16)runcode->map[fi+1].reg.orig << 16);
+            | .long packed
+        }
+        if (flag_count & 1) {
+            MVMuint32 last = (MVMuint32)(MVMuint16)runcode->map[flag_count-1].reg.orig;
+            | .long last
+        }
+    }
+    | .code
+
+    /* Set up frame return info */
+    | get_cur_op TMP2
+    | ldr TMP5, TC->cur_frame
+    | str TMP2, FRAME:TMP5->return_address
+    if (sizeof(MVMReturnType) == 1) {
+        | mov TMP2, #runcode->return_type
+        | strb w10, FRAME:TMP5->return_type
+    } else {
+        MVM_panic(1, "JIT: MVMReturnType has unexpected size");
+    }
+    if (runcode->return_type == MVM_RETURN_VOID) {
+        | str xzr, FRAME:TMP5->return_value
+    } else {
+        MVMint32 rv_off = runcode->return_register * (MVMint32)sizeof(MVMRegister);
+        | add TMP2, x21, #rv_off
+        | str TMP2, FRAME:TMP5->return_value
+    }
+
+    /* Build MVMArgs on stack (AAPCS64: struct > 16 bytes passed by pointer) */
+    | sub sp, sp, #32
+    | .data
+    | 6:
+    | .quad (uintptr_t)(runcode->callsite)
+    | .code
+    | ldr TMP6, <6
+    | str TMP6, [sp]
+    | ldr TMP6, TC->interp_reg_base
+    | ldr TMP6, [TMP6]
+    | str TMP6, [sp, #8]
+    | adr TMP6, <5
+    | str TMP6, [sp, #16]
+
+    | mov ARG1, x19
+    | mov ARG2, sp
+
+    MVMSpeshFacts *function_facts =
+        MVM_spesh_get_facts(tc, jg->sg, runcode->code_operand);
+    if ((function_facts->flags & MVM_SPESH_FACT_KNOWN_VALUE) && function_facts->value.o) {
+        uintptr_t call_target =
+            (uintptr_t)(((MVMCFunction *)function_facts->value.o)->body.func);
+        | .data
+        | 7:
+        | .quad call_target
+        | .code
+        | ldr FUNCTION, <7
+        | blr FUNCTION
+    } else {
+        MVMint32 code_op_off = runcode->code_operand.reg.orig * (MVMint32)sizeof(MVMRegister);
+        | ldr FUNCTION, [x21, #code_op_off]
+        | ldr FUNCTION, CFUNCTION:FUNCTION->body.func
+        | blr FUNCTION
+    }
+    | add sp, sp, #32
 }
 
 void MVM_jit_emit_runnativecall(MVMThreadContext *tc, MVMJitCompiler *compiler,
                                 MVMJitGraph *jg, MVMJitRunNativeCall *runcode) {
-    MVM_oops(tc, "ARM64 JIT: emit_runnativecall not yet implemented");
+    /* Set up frame return info */
+    | get_cur_op TMP2
+    | ldr TMP5, TC->cur_frame
+    | str TMP2, FRAME:TMP5->return_address
+    if (sizeof(MVMReturnType) == 1) {
+        | mov TMP2, #runcode->return_type
+        | strb w10, FRAME:TMP5->return_type
+    } else {
+        MVM_panic(1, "JIT: MVMReturnType has unexpected size");
+    }
+    if (runcode->return_type == MVM_RETURN_VOID) {
+        | str xzr, FRAME:TMP5->return_value
+    } else {
+        MVMint32 rv_off = runcode->return_register * (MVMint32)sizeof(MVMRegister);
+        | add TMP2, x21, #rv_off
+        | str TMP2, FRAME:TMP5->return_value
+    }
+
+    /* Set up call arguments */
+    emit_arm64_callargs(tc, compiler, jg, runcode->args, runcode->num_args);
+
+    /* Call the native function */
+    | .data
+    | 5:
+    | .quad (MVMuint64)(uintptr_t)(runcode->entry_point)
+    | .code
+    | ldr FUNCTION, <5
+    | blr FUNCTION
+
+    if (runcode->return_type != MVM_RETURN_VOID) {
+        MVMint32 rv_off = runcode->return_register * (MVMint32)sizeof(MVMRegister);
+        /* Sign-extend narrow integer return values */
+        if (runcode->rv_type == MVM_NATIVECALL_ARG_CHAR) {
+            | sxtb x0, x0
+        } else if (runcode->rv_type == MVM_NATIVECALL_ARG_SHORT) {
+            | sxth x0, x0
+        } else if (runcode->rv_type == MVM_NATIVECALL_ARG_INT) {
+            | sxtw x0, w0
+        }
+        /* Zero-extend narrow unsigned return values */
+        if (runcode->rv_type == MVM_NATIVECALL_ARG_UCHAR) {
+            | and x0, x0, #0xFF
+        } else if (runcode->rv_type == MVM_NATIVECALL_ARG_USHORT) {
+            | and x0, x0, #0xFFFF
+        } else if (runcode->rv_type == MVM_NATIVECALL_ARG_UINT) {
+            | and x0, x0, #0xFFFFFFFF
+        } else if (runcode->rv_type == MVM_NATIVECALL_ARG_ULONG && sizeof(long) == 4) {
+            | and x0, x0, #0xFFFFFFFF
+        }
+        | str RV, [x21, #rv_off]
+    }
 }
 
 void MVM_jit_emit_dispatch(MVMThreadContext *tc, MVMJitCompiler *compiler,
                            MVMJitGraph *jg, MVMJitDispatch *dispatch) {
-    MVM_oops(tc, "ARM64 JIT: emit_dispatch not yet implemented");
+    MVMint16 i;
+    MVMuint64 slot_off = (MVMuint64)dispatch->ice_slot * sizeof(void *);
+
+    /* Arg map at label 5 */
+    | .data
+    |5:
+    {
+        MVMuint32 flag_count = dispatch->callsite->flag_count;
+        MVMuint32 fi;
+        for (fi = 0; fi + 2 <= flag_count; fi += 2) {
+            MVMuint32 packed = (MVMuint32)(MVMuint16)dispatch->map[fi].reg.orig | ((MVMuint32)(MVMuint16)dispatch->map[fi+1].reg.orig << 16);
+            | .long packed
+        }
+        if (flag_count & 1) {
+            MVMuint32 last = (MVMuint32)(MVMuint16)dispatch->map[flag_count-1].reg.orig;
+            | .long last
+        }
+    }
+    | .code
+
+    /* Frame return setup */
+    | get_cur_op TMP2
+    | ldr TMP5, TC->cur_frame
+    | str TMP2, FRAME:TMP5->return_address
+    if (sizeof(MVMReturnType) == 1) {
+        | mov TMP2, #dispatch->return_type
+        | strb w10, FRAME:TMP5->return_type
+    } else {
+        MVM_panic(1, "JIT: MVMReturnType has unexpected size");
+    }
+    if (dispatch->return_type == MVM_RETURN_VOID) {
+        | str xzr, FRAME:TMP5->return_value
+    } else {
+        MVMint32 rv_off = dispatch->return_register * (MVMint32)sizeof(MVMRegister);
+        | add TMP2, x21, #rv_off
+        | str TMP2, FRAME:TMP5->return_value
+    }
+
+    /* Build register args.
+     * run_dispatch(tc, entry_ptr, seen, id, cs, arg_indices, source, sf, bytecode_offset)
+     * x0-x7 = 8 register args; bytecode_offset = -1 on stack. */
+    | mov ARG1, x19
+    | get_spesh_slot TMP6, dispatch->sf_slot
+    | ldr ARG2, STATICFRAME:TMP6->body.inline_cache.entries
+    | .data
+    | 8:
+    | .quad slot_off
+    | .code
+    | ldr TMP3, <8
+    | add ARG2, ARG2, TMP3
+    | ldr ARG3, [ARG2]
+    | get_string ARG4, dispatch->id
+    | .data
+    | 6:
+    | .quad (uintptr_t)(dispatch->callsite)
+    | .code
+    | ldr ARG5, <6
+    | adr ARG6, <5
+    | mov x6, x21
+    | mov x7, TMP6
+
+    /* 9th arg (bytecode_offset = -1) on stack */
+    | sub sp, sp, #16
+    | mov TMP1, #-1
+    | str TMP1, [sp]
+
+    | ldr FUNCTION, MVMDISPINLINECACHEENTRY:ARG3->run_dispatch
+    | blr FUNCTION
+    | add sp, sp, #16
 }
 
 void MVM_jit_emit_istype(MVMThreadContext *tc, MVMJitCompiler *compiler,
                          MVMJitGraph *jg, MVMJitIsType *istype) {
-    MVM_oops(tc, "ARM64 JIT: emit_istype not yet implemented");
+    MVMuint64 slot_off;
+
+    /* Try cache first */
+    | mov ARG1, x19
+    | ldr ARG2, [x21, #(istype->obj_register * sizeof(MVMRegister))]
+    | ldr ARG3, [x21, #(istype->type_register * sizeof(MVMRegister))]
+    | add ARG4, x21, #(istype->return_register * sizeof(MVMRegister))
+    | callp &MVM_6model_try_cache_type_check
+
+    | cbnz RV, =>(istype->reentry_label)
+
+    /* Check for HLL istype dispatcher */
+    {
+        MVMStaticFrame *sf = (MVMStaticFrame *)jg->sg->spesh_slots[istype->sf_slot];
+        MVMHLLConfig *hll = sf->body.cu->body.hll_config;
+        if (hll->istype_dispatcher) {
+            /* Arg map at label 5 */
+            | .data
+            |5:
+            {
+                MVMuint32 packed = (MVMuint32)(MVMuint16)istype->obj_register | ((MVMuint32)(MVMuint16)istype->type_register << 16);
+                | .long packed
+            }
+            | .code
+
+            /* Frame return setup */
+            | get_cur_op TMP2
+            | ldr TMP5, TC->cur_frame
+            | str TMP2, FRAME:TMP5->return_address
+            | mov TMP2, #MVM_RETURN_INT
+            | strb w10, FRAME:TMP5->return_type
+            | add TMP2, x21, #(istype->return_register * sizeof(MVMRegister))
+            | str TMP2, FRAME:TMP5->return_value
+
+            slot_off = (MVMuint64)istype->ice_slot * sizeof(void *);
+            | mov ARG1, x19
+            | get_spesh_slot TMP6, istype->sf_slot
+            | ldr ARG2, STATICFRAME:TMP6->body.inline_cache.entries
+            | .data
+            | 8:
+            | .quad slot_off
+            | .code
+            | ldr TMP3, <8
+            | add ARG2, ARG2, TMP3
+            | ldr ARG3, [ARG2]
+            MVMString **id_addr = &(hll->istype_dispatcher);
+            | .data
+            | 6:
+            | .quad (uintptr_t)id_addr
+            | .code
+            | ldr ARG4, <6
+            | ldr ARG4, [ARG4]
+            MVMCallsite *callsite = MVM_callsite_get_common(tc, MVM_CALLSITE_ID_OBJ_OBJ);
+            | .data
+            | 7:
+            | .quad (uintptr_t)callsite
+            | .code
+            | ldr ARG5, <7
+            | adr ARG6, <5
+            | mov x6, x21
+            | mov x7, TMP6
+
+            | sub sp, sp, #16
+            | mov TMP1, #-1
+            | str TMP1, [sp]
+            | ldr FUNCTION, MVMDISPINLINECACHEENTRY:ARG3->run_dispatch
+            | blr FUNCTION
+            | add sp, sp, #16
+        }
+    }
 }
