@@ -1,0 +1,716 @@
+/* -*-C-*- */
+/* ARM64 JIT tile emit functions.
+ * Included verbatim into emit.dasc via |.include. */
+
+#ifndef _MSC_VER
+#pragma GCC diagnostic ignored "-Wunused-variable"
+#endif
+
+#define DIE(...) do { MVM_oops(tc, __VA_ARGS__); } while (0)
+
+/* x16 (register 16 = FUNCTION/IP0) is the spare scratch register.
+ * The register allocator never assigns values to x16. Safe to clobber. */
+#define SCRATCH 16
+
+/* Emit `add Rx(out), Rx(base), #imm` handling offsets > 4095 via x16. */
+static void arm64_add_imm(MVMThreadContext *tc, MVMJitCompiler *compiler,
+                          MVMint8 out, MVMint8 base, MVMint32 imm) {
+    MVMuint32 uimm = (MVMuint32)imm;
+    if (uimm <= 4095u) {
+        | add Rx(out), Rx(base), #imm
+    } else {
+        | movz x16, #(uimm & 0xffffu)
+        if (uimm > 0xffffu) {
+            | movk x16, #(uimm >> 16), lsl #16
+        }
+        | add Rx(out), Rx(base), x16
+    }
+}
+
+/* Emit `mov x16, #val` for an arbitrary 32-bit constant into x16. */
+static void arm64_mov_imm32_scratch(MVMThreadContext *tc, MVMJitCompiler *compiler,
+                                    MVMint32 val) {
+    MVMuint32 uval = (MVMuint32)val;
+    | movz x16, #(uval & 0xffffu)
+    if (uval > 0xffffu) {
+        | movk x16, #(uval >> 16), lsl #16
+    }
+}
+
+/* Move tile call result to the right destination register. */
+static void arm64_move_tile_call_value(MVMThreadContext *tc, MVMJitCompiler *compiler,
+                                       MVMJitTile *tile) {
+    if (MVM_JIT_TILE_YIELDS_VALUE(tile)) {
+        MVMint8 out = tile->values[0];
+        if (ARM64_IS_GPR(out)) {
+            | mov Rx(ARM64_GPR_NUM(out)), x0
+        } else {
+            | fmov Rd(ARM64_FPR_NUM(out)), d0
+        }
+    }
+}
+
+/* ---- Memory: addr / idx / const ---------------------------------------- */
+
+MVM_JIT_TILE_DECL(addr) {
+    MVMint8 out  = tile->values[0];
+    MVMint8 base = tile->values[1];
+    MVMint32 ofs = tile->args[0];
+    arm64_add_imm(tc, compiler, out, base, ofs);
+}
+
+MVM_JIT_TILE_DECL(idx) {
+    MVMint8 out  = tile->values[0];
+    MVMint8 base = tile->values[1];
+    MVMint8 idx  = tile->values[2];
+    MVMint8 scl  = tile->args[0];
+    switch (scl) {
+    case 1:
+        | add Rx(out), Rx(base), Rx(idx)
+        break;
+    case 2:
+        | add Rx(out), Rx(base), Rx(idx), lsl #1
+        break;
+    case 4:
+        | add Rx(out), Rx(base), Rx(idx), lsl #2
+        break;
+    case 8:
+        | add Rx(out), Rx(base), Rx(idx), lsl #3
+        break;
+    default:
+        DIE("idx: unsupported scale %d", scl);
+    }
+}
+
+MVM_JIT_TILE_DECL(const_reg) {
+    MVMint8 out    = tile->values[0];
+    MVMint32 val   = tile->args[0];
+    MVMuint32 uval = (MVMuint32)val;
+    | movz Rx(out), #(uval & 0xffffu)
+    if (uval > 0xffffu) {
+        | movk Rx(out), #(uval >> 16), lsl #16
+    }
+}
+
+MVM_JIT_TILE_DECL(const_large) {
+    MVMint8 out  = tile->values[0];
+    MVMint64 val = tree->constants[tile->args[0]].i;
+    MVMuint32 lo, hi;
+    lo = (MVMuint32)((MVMuint64)val & 0xffffffffu);
+    hi = (MVMuint32)((MVMuint64)val >> 32);
+    | .data
+    |5:
+    | .long lo
+    | .long hi
+    | .code
+    | ldr Rx(out), <5
+}
+
+MVM_JIT_TILE_DECL(const_num) {
+    MVMint8 out  = ARM64_FPR_NUM(tile->values[0]);
+    MVMnum64 val = tree->constants[tile->args[0]].n;
+    MVMuint64 bits;
+    MVMuint32 lo, hi;
+    memcpy(&bits, &val, sizeof(bits));
+    lo = (MVMuint32)(bits & 0xffffffffu);
+    hi = (MVMuint32)(bits >> 32);
+    | .data
+    |5:
+    | .long lo
+    | .long hi
+    | .code
+    | ldr Rd(out), <5
+}
+
+/* ---- Loads -------------------------------------------------------------- */
+
+MVM_JIT_TILE_DECL(load_reg) {
+    MVMint8 out   = tile->values[0];
+    MVMint8 base  = tile->values[1];
+    MVMint32 size = tile->args[0];
+    MVMint8 n     = ARM64_GPR_NUM(out);
+    switch (size) {
+    case 1:
+        | ldrb Rw(n), [Rx(base)]
+        break;
+    case 2:
+        | ldrh Rw(n), [Rx(base)]
+        break;
+    case 4:
+        | ldr Rw(n), [Rx(base)]
+        break;
+    case 8:
+        | ldr Rx(n), [Rx(base)]
+        break;
+    default:
+        DIE("load_reg: unsupported size %d", size);
+    }
+}
+
+MVM_JIT_TILE_DECL(load_addr) {
+    MVMint8 out   = tile->values[0];
+    MVMint8 base  = tile->values[1];
+    MVMint32 ofs  = tile->args[0];
+    MVMint32 size = tile->args[1];
+    MVMint8 n     = ARM64_GPR_NUM(out);
+    switch (size) {
+    case 1:
+        | ldrb Rw(n), [Rx(base), #ofs]
+        break;
+    case 2:
+        | ldrh Rw(n), [Rx(base), #ofs]
+        break;
+    case 4:
+        | ldr Rw(n), [Rx(base), #ofs]
+        break;
+    case 8:
+        | ldr Rx(n), [Rx(base), #ofs]
+        break;
+    default:
+        DIE("load_addr: unsupported size %d", size);
+    }
+}
+
+MVM_JIT_TILE_DECL(load_idx) {
+    MVMint8 out   = tile->values[0];
+    MVMint8 base  = tile->values[1];
+    MVMint8 idx   = tile->values[2];
+    MVMint8 scl   = tile->args[0];
+    MVMint32 size = tile->args[1];
+    MVMint8 n     = ARM64_GPR_NUM(out);
+    switch (scl) {
+    case 1:
+        | add x16, Rx(base), Rx(idx)
+        break;
+    case 2:
+        | add x16, Rx(base), Rx(idx), lsl #1
+        break;
+    case 4:
+        | add x16, Rx(base), Rx(idx), lsl #2
+        break;
+    case 8:
+        | add x16, Rx(base), Rx(idx), lsl #3
+        break;
+    default:
+        DIE("load_idx: unsupported scale %d", scl);
+    }
+    switch (size) {
+    case 1:
+        | ldrb Rw(n), [x16]
+        break;
+    case 2:
+        | ldrh Rw(n), [x16]
+        break;
+    case 4:
+        | ldr Rw(n), [x16]
+        break;
+    case 8:
+        | ldr Rx(n), [x16]
+        break;
+    default:
+        DIE("load_idx: unsupported size %d", size);
+    }
+}
+
+MVM_JIT_TILE_DECL(load_num) {
+    MVMint8 out  = ARM64_FPR_NUM(tile->values[0]);
+    MVMint8 addr = tile->values[1];
+    | ldr Rd(out), [Rx(addr)]
+}
+
+MVM_JIT_TILE_DECL(load_num_addr) {
+    MVMint8 out  = ARM64_FPR_NUM(tile->values[0]);
+    MVMint8 addr = tile->values[1];
+    MVMint32 ofs = tile->args[0];
+    | ldr Rd(out), [Rx(addr), #ofs]
+}
+
+/* ---- Stores ------------------------------------------------------------- */
+
+MVM_JIT_TILE_DECL(store) {
+    MVMint8 base  = tile->values[1];
+    MVMint8 value = tile->values[2];
+    MVMint32 size = tile->args[0];
+    MVMint8 n     = ARM64_GPR_NUM(value);
+    switch (size) {
+    case 1:
+        | strb Rw(n), [Rx(base)]
+        break;
+    case 2:
+        | strh Rw(n), [Rx(base)]
+        break;
+    case 4:
+        | str Rw(n), [Rx(base)]
+        break;
+    case 8:
+        | str Rx(n), [Rx(base)]
+        break;
+    default:
+        DIE("store: unsupported size %d", size);
+    }
+}
+
+MVM_JIT_TILE_DECL(store_addr) {
+    MVMint8 base  = tile->values[1];
+    MVMint8 value = tile->values[2];
+    MVMint32 ofs  = tile->args[0];
+    MVMint32 size = tile->args[1];
+    MVMint8 n     = ARM64_GPR_NUM(value);
+    switch (size) {
+    case 1:
+        | strb Rw(n), [Rx(base), #ofs]
+        break;
+    case 2:
+        | strh Rw(n), [Rx(base), #ofs]
+        break;
+    case 4:
+        | str Rw(n), [Rx(base), #ofs]
+        break;
+    case 8:
+        | str Rx(n), [Rx(base), #ofs]
+        break;
+    default:
+        DIE("store_addr: unsupported size %d", size);
+    }
+}
+
+MVM_JIT_TILE_DECL(store_idx) {
+    MVMint8 base  = tile->values[1];
+    MVMint8 idx   = tile->values[2];
+    MVMint8 scl   = tile->args[0];
+    MVMint32 size = tile->args[1];
+    MVMint8 value = tile->values[3];
+    MVMint8 n     = ARM64_GPR_NUM(value);
+    switch (scl) {
+    case 1:
+        | add x16, Rx(base), Rx(idx)
+        break;
+    case 2:
+        | add x16, Rx(base), Rx(idx), lsl #1
+        break;
+    case 4:
+        | add x16, Rx(base), Rx(idx), lsl #2
+        break;
+    case 8:
+        | add x16, Rx(base), Rx(idx), lsl #3
+        break;
+    default:
+        DIE("store_idx: unsupported scale %d", scl);
+    }
+    switch (size) {
+    case 1:
+        | strb Rw(n), [x16]
+        break;
+    case 2:
+        | strh Rw(n), [x16]
+        break;
+    case 4:
+        | str Rw(n), [x16]
+        break;
+    case 8:
+        | str Rx(n), [x16]
+        break;
+    default:
+        DIE("store_idx: unsupported size %d", size);
+    }
+}
+
+MVM_JIT_TILE_DECL(store_num) {
+    MVMint8 addr  = tile->values[1];
+    MVMint8 value = ARM64_FPR_NUM(tile->values[2]);
+    | str Rd(value), [Rx(addr)]
+}
+
+MVM_JIT_TILE_DECL(store_num_addr) {
+    MVMint8 addr  = tile->values[1];
+    MVMint8 value = ARM64_FPR_NUM(tile->values[2]);
+    MVMint32 ofs  = tile->args[0];
+    | str Rd(value), [Rx(addr), #ofs]
+}
+
+/* ---- Casts -------------------------------------------------------------- */
+
+MVM_JIT_TILE_DECL(cast_signed) {
+    MVMint32 to_size   = tile->args[0];
+    MVMint32 from_size = tile->args[1];
+    MVMint8  to_reg    = tile->values[0];
+    MVMint8  from_reg  = tile->values[1];
+    /* from_size | (to_size << 3) key (same as x64 tiles) */
+    MVMint32 size_conv = from_size | (to_size << 3);
+    switch (size_conv) {
+    case 17: /* 1->2 */
+        | sxth Rx(to_reg), Rx(from_reg)
+        break;
+    case 33: /* 1->4 */
+    case 65: /* 1->8 */
+        | sxtb Rx(to_reg), Rx(from_reg)
+        break;
+    case 34: /* 2->4 */
+    case 66: /* 2->8 */
+        | sxth Rx(to_reg), Rx(from_reg)
+        break;
+    case 68: /* 4->8 */
+        | sxtw Rx(to_reg), Rw(ARM64_GPR_NUM(from_reg))
+        break;
+    default:
+        DIE("cast_signed: unsupported %d->%d", from_size, to_size);
+    }
+}
+
+MVM_JIT_TILE_DECL(cast_unsigned) {
+    MVMint32 to_size   = tile->args[0];
+    MVMint32 from_size = tile->args[1];
+    MVMint8  to_reg    = tile->values[0];
+    MVMint8  from_reg  = tile->values[1];
+    MVMint32 size_conv = from_size | (to_size << 3);
+    /* ARM64: 32-bit writes zero-extend to 64 automatically.
+     * For narrowing/widening from 8/16: AND with mask. */
+    switch (size_conv) {
+    case 8:  /* 8->1 */
+    case 10: /* 2->1 */
+    case 12: /* 4->1 */
+    case 33: /* 1->4 */
+    case 65: /* 1->8 */
+        | and Rx(to_reg), Rx(from_reg), #0xff
+        break;
+    case 17: /* 1->2 */
+    case 20: /* 4->2 */
+    case 24: /* 8->2 */
+    case 34: /* 2->4 */
+    case 66: /* 2->8 */
+        | and Rx(to_reg), Rx(from_reg), #0xffff
+        break;
+    case 40: /* 8->4 */
+    case 68: /* 4->8 */
+        /* 32-bit write auto-clears upper 32 bits on ARM64 */
+        | mov Rw(ARM64_GPR_NUM(to_reg)), Rw(ARM64_GPR_NUM(from_reg))
+        break;
+    default:
+        DIE("cast_unsigned: unsupported %d->%d", from_size, to_size);
+    }
+}
+
+/* ---- Integer arithmetic ------------------------------------------------- */
+
+MVM_JIT_TILE_DECL(add_reg) {
+    MVMint8 out = tile->values[0];
+    MVMint8 in1 = tile->values[1];
+    MVMint8 in2 = tile->values[2];
+    | add Rx(out), Rx(in1), Rx(in2)
+}
+
+MVM_JIT_TILE_DECL(add_const) {
+    MVMint8 out  = tile->values[0];
+    MVMint8 in1  = tile->values[1];
+    MVMint32 val = tile->args[0];
+    MVMuint32 uv = (MVMuint32)val;
+    if (uv <= 4095u) {
+        | add Rx(out), Rx(in1), #val
+    } else {
+        arm64_mov_imm32_scratch(tc, compiler, val);
+        | add Rx(out), Rx(in1), x16
+    }
+}
+
+MVM_JIT_TILE_DECL(and_reg) {
+    MVMint8 out = tile->values[0];
+    MVMint8 in1 = tile->values[1];
+    MVMint8 in2 = tile->values[2];
+    | and Rx(out), Rx(in1), Rx(in2)
+}
+
+MVM_JIT_TILE_DECL(and_const) {
+    MVMint8 out  = tile->values[0];
+    MVMint8 in1  = tile->values[1];
+    MVMint32 val = tile->args[0];
+    /* ARM64 AND-immediate only accepts bitmask immediates — use register form. */
+    arm64_mov_imm32_scratch(tc, compiler, val);
+    | and Rx(out), Rx(in1), x16
+}
+
+MVM_JIT_TILE_DECL(mul_reg) {
+    MVMint8 out = tile->values[0];
+    MVMint8 in1 = tile->values[1];
+    MVMint8 in2 = tile->values[2];
+    | mul Rx(out), Rx(in1), Rx(in2)
+}
+
+MVM_JIT_TILE_DECL(or_reg) {
+    MVMint8 out = tile->values[0];
+    MVMint8 in1 = tile->values[1];
+    MVMint8 in2 = tile->values[2];
+    | orr Rx(out), Rx(in1), Rx(in2)
+}
+
+MVM_JIT_TILE_DECL(xor_reg) {
+    MVMint8 out = tile->values[0];
+    MVMint8 in1 = tile->values[1];
+    MVMint8 in2 = tile->values[2];
+    | eor Rx(out), Rx(in1), Rx(in2)
+}
+
+MVM_JIT_TILE_DECL(not_reg) {
+    MVMint8 out = tile->values[0];
+    MVMint8 in  = tile->values[1];
+    | mvn Rx(out), Rx(in)
+}
+
+MVM_JIT_TILE_DECL(sub_reg) {
+    MVMint8 out = tile->values[0];
+    MVMint8 in1 = tile->values[1];
+    MVMint8 in2 = tile->values[2];
+    | sub Rx(out), Rx(in1), Rx(in2)
+}
+
+MVM_JIT_TILE_DECL(sub_const) {
+    MVMint8 out  = tile->values[0];
+    MVMint8 in1  = tile->values[1];
+    MVMint32 val = tile->args[0];
+    MVMuint32 uv = (MVMuint32)val;
+    if (uv <= 4095u) {
+        | sub Rx(out), Rx(in1), #val
+    } else {
+        arm64_mov_imm32_scratch(tc, compiler, val);
+        | sub Rx(out), Rx(in1), x16
+    }
+}
+
+/* ---- FP arithmetic ------------------------------------------------------ */
+
+MVM_JIT_TILE_DECL(add_num) {
+    MVMint8 out = ARM64_FPR_NUM(tile->values[0]);
+    MVMint8 in1 = ARM64_FPR_NUM(tile->values[1]);
+    MVMint8 in2 = ARM64_FPR_NUM(tile->values[2]);
+    | fadd Rd(out), Rd(in1), Rd(in2)
+}
+
+MVM_JIT_TILE_DECL(sub_num) {
+    MVMint8 out = ARM64_FPR_NUM(tile->values[0]);
+    MVMint8 in1 = ARM64_FPR_NUM(tile->values[1]);
+    MVMint8 in2 = ARM64_FPR_NUM(tile->values[2]);
+    | fsub Rd(out), Rd(in1), Rd(in2)
+}
+
+MVM_JIT_TILE_DECL(mul_num) {
+    MVMint8 out = ARM64_FPR_NUM(tile->values[0]);
+    MVMint8 in1 = ARM64_FPR_NUM(tile->values[1]);
+    MVMint8 in2 = ARM64_FPR_NUM(tile->values[2]);
+    | fmul Rd(out), Rd(in1), Rd(in2)
+}
+
+/* ---- Tests and comparisons ---------------------------------------------- */
+
+MVM_JIT_TILE_DECL(test) {
+    MVMint8 reg = tile->values[1];
+    /* ARM64: CMP reg, #0 sets NZCV flags for all subsequent b.cond / cset. */
+    switch (tile->size) {
+    case 1:
+    case 2:
+    case 4:
+        | cmp Rw(ARM64_GPR_NUM(reg)), #0
+        break;
+    case 0:
+    case 8:
+    default:
+        | cmp Rx(reg), #0
+        break;
+    }
+}
+
+MVM_JIT_TILE_DECL(test_addr) {
+    MVMint8 base  = tile->values[1];
+    MVMint32 ofs  = tile->args[0];
+    MVMint32 size = tile->args[1];
+    switch (size) {
+    case 1:
+        | ldrb w16, [Rx(base), #ofs]
+        | cmp x16, #0
+        break;
+    case 2:
+        | ldrh w16, [Rx(base), #ofs]
+        | cmp x16, #0
+        break;
+    case 4:
+        | ldr w16, [Rx(base), #ofs]
+        | cmp x16, #0
+        break;
+    case 8:
+        | ldr x16, [Rx(base), #ofs]
+        | cmp x16, #0
+        break;
+    default:
+        DIE("test_addr: unsupported size %d", size);
+    }
+}
+
+MVM_JIT_TILE_DECL(test_and) {
+    MVMint8 rega = tile->values[1];
+    MVMint8 regb = tile->values[2];
+    switch (tile->size) {
+    case 1:
+    case 2:
+    case 4:
+        | tst Rw(ARM64_GPR_NUM(rega)), Rw(ARM64_GPR_NUM(regb))
+        break;
+    case 0:
+    case 8:
+    default:
+        | tst Rx(rega), Rx(regb)
+        break;
+    }
+}
+
+MVM_JIT_TILE_DECL(test_const) {
+    MVMint8 reg  = tile->values[1];
+    MVMint32 val = tile->args[0];
+    /* TST-immediate requires bitmask immediate; use register form to be safe. */
+    arm64_mov_imm32_scratch(tc, compiler, val);
+    | tst Rx(reg), x16
+}
+
+MVM_JIT_TILE_DECL(cmp) {
+    MVMint8 regl = tile->values[1];
+    MVMint8 regr = tile->values[2];
+    switch (tile->size) {
+    case 1:
+    case 2:
+    case 4:
+        | cmp Rw(ARM64_GPR_NUM(regl)), Rw(ARM64_GPR_NUM(regr))
+        break;
+    case 0:
+    case 8:
+    default:
+        | cmp Rx(regl), Rx(regr)
+        break;
+    }
+}
+
+MVM_JIT_TILE_DECL(test_num) {
+    MVMint8 reg = ARM64_FPR_NUM(tile->values[1]);
+    | fcmp Rd(reg), #0.0
+}
+
+MVM_JIT_TILE_DECL(cmp_num) {
+    MVMint8 left  = ARM64_FPR_NUM(tile->values[1]);
+    MVMint8 right = ARM64_FPR_NUM(tile->values[2]);
+    | fcmp Rd(left), Rd(right)
+}
+
+/* ---- Flagval: materialise comparison result into a register ------------- */
+
+MVM_JIT_TILE_DECL(flagval) {
+    MVMint8 out = tile->values[0];
+    MVMint32 child = MVM_JIT_EXPR_LINKS(tree, tile->node)[0];
+    enum MVMJitExprOperator flag = tree->nodes[child];
+    MVMuint8 test_type = MVM_JIT_EXPR_INFO(tree, child)->type;
+    MVMint32 is_float  = (test_type == MVM_reg_num32 || test_type == MVM_reg_num64);
+
+    if (is_float) {
+        /* After FCMP: NaN produces N=0,Z=0,C=1,V=1.
+         * Most conditions naturally exclude NaN via ARM64 flag semantics. */
+        switch (flag) {
+        case MVM_JIT_LT:
+            /* MI: N=1; false for NaN (N=0 after NaN fcmp) */
+            | cset Rx(out), mi
+            break;
+        case MVM_JIT_LE:
+            /* LS: C=0 or Z=1; false for NaN (C=1,Z=0) */
+            | cset Rx(out), ls
+            break;
+        case MVM_JIT_ZR:
+        case MVM_JIT_EQ:
+            /* EQ: Z=1; false for NaN (Z=0 after NaN fcmp) */
+            | cset Rx(out), eq
+            break;
+        case MVM_JIT_NZ:
+        case MVM_JIT_NE:
+            /* NE: Z=0; NaN has Z=0 so NaN counts as NE (matches IEEE 754 NaN!=NaN) */
+            | cset Rx(out), ne
+            break;
+        case MVM_JIT_GE:
+            /* HS: C=1; NaN has C=1, so must exclude V=1 with VC mask */
+            | cset Rx(out), hs
+            | cset x16, vc
+            | and Rx(out), Rx(out), x16
+            break;
+        case MVM_JIT_GT:
+            /* HI: C=1 and Z=0; NaN has C=1,Z=0 so must exclude V=1 */
+            | cset Rx(out), hi
+            | cset x16, vc
+            | and Rx(out), Rx(out), x16
+            break;
+        default:
+            abort();
+        }
+    } else {
+        switch (flag) {
+        case MVM_JIT_LT:
+            | cset Rx(out), lt
+            break;
+        case MVM_JIT_LE:
+            | cset Rx(out), le
+            break;
+        case MVM_JIT_ZR:
+        case MVM_JIT_EQ:
+            | cset Rx(out), eq
+            break;
+        case MVM_JIT_NZ:
+        case MVM_JIT_NE:
+            | cset Rx(out), ne
+            break;
+        case MVM_JIT_GE:
+            | cset Rx(out), ge
+            break;
+        case MVM_JIT_GT:
+            | cset Rx(out), gt
+            break;
+        default:
+            abort();
+        }
+    }
+    /* cset on ARM64 already produces 0 or 1 in a 64-bit register — no movzx needed */
+}
+
+/* ---- Labels and branches ------------------------------------------------ */
+
+MVM_JIT_TILE_DECL(mark) {
+    MVMint32 label = tile->args[0];
+    |=>(label):
+}
+
+MVM_JIT_TILE_DECL(label) {
+    MVMint8 reg    = tile->values[0];
+    MVMint32 label = tile->args[0];
+    | adr Rx(reg), =>(label)
+}
+
+MVM_JIT_TILE_DECL(branch_label) {
+    MVMint32 label = tile->args[0];
+    if (label >= 0) {
+        | b =>(label)
+    } else {
+        | b ->exit
+    }
+}
+
+/* ---- Calls from expression trees ---------------------------------------- */
+
+MVM_JIT_TILE_DECL(call) {
+    MVMint8 reg = tile->values[1];
+    | blr Rx(reg)
+    arm64_move_tile_call_value(tc, compiler, tile);
+}
+
+MVM_JIT_TILE_DECL(call_func) {
+    uintptr_t ptr = tree->constants[tile->args[0]].u;
+    | callp ptr
+    arm64_move_tile_call_value(tc, compiler, tile);
+}
+
+MVM_JIT_TILE_DECL(call_addr) {
+    MVMint8 reg  = tile->values[1];
+    MVMint32 ofs = tile->args[0];
+    | ldr FUNCTION, [Rx(reg), #ofs]
+    | blr FUNCTION
+    arm64_move_tile_call_value(tc, compiler, tile);
+}

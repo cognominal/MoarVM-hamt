@@ -1135,3 +1135,6 @@ void MVM_jit_emit_istype(MVMThreadContext *tc, MVMJitCompiler *compiler,
         }
     }
 }
+
+/* ---- Expression tile emit functions ------------------------------------ */
+|.include src/jit/arm64/tiles.dasc

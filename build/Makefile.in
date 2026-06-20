@@ -686,7 +686,7 @@ src/jit/x64/emit.c: src/jit/x64/emit.dasc src/jit/x64/tiles.dasc $(MINILUA) $(DY
 
 src/jit/arm64/emit@obj@: src/jit/arm64/emit.c $(DYNASM_HEADERS) 3rdparty/dynasm/dasm_arm64.h
 
-src/jit/arm64/emit.c: src/jit/arm64/emit.dasc $(MINILUA) 3rdparty/dynasm/dynasm.lua 3rdparty/dynasm/dasm_arm64.lua
+src/jit/arm64/emit.c: src/jit/arm64/emit.dasc src/jit/arm64/tiles.dasc $(MINILUA) 3rdparty/dynasm/dynasm.lua 3rdparty/dynasm/dasm_arm64.lua
 
 # Expression list tables
 src/jit/core_templates.h: src/jit/core_templates.expr src/jit/macro.expr \
@@ -697,8 +697,11 @@ src/jit/core_templates.h: src/jit/core_templates.expr src/jit/macro.expr \
 src/jit/x64/tile_pattern.h: src/jit/x64/tile_pattern.tile src/jit/expr_ops.h \
    tools/tiler-table-generator.pl $(JIT_PERL_LIBS)
 
+src/jit/arm64/tile_pattern.h: src/jit/arm64/tile_pattern.tile src/jit/expr_ops.h \
+   tools/tiler-table-generator.pl $(JIT_PERL_LIBS)
+
 src/jit/expr@obj@: src/jit/core_templates.h
-src/jit/tile@obj@: src/jit/x64/tile_pattern.h
+src/jit/tile@obj@: src/jit/x64/tile_pattern.h src/jit/arm64/tile_pattern.h
 
 src/jit/compile@obj@ src/jit/linear_scan@obj@ src/jit/x64/arch@obj@ @jit_obj@: src/jit/internal.h src/jit/x64/arch.h
 src/jit/arm64/arch@obj@: src/jit/internal.h src/jit/arm64/arch.h
