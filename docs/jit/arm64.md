@@ -125,22 +125,30 @@ coverage. Each currently calls `MVM_oops`.
 
 ---
 
-## Milestone 4 — Trampoline (`jit_return_address`)
+## Milestone 4 — Trampoline (`jit_return_address`) (DONE)
 
-On x64, the trampoline works by using `call` to push the return address on the
-stack before entering JIT code; when the JIT frame needs to deopt or invoke the
-interpreter it jumps back to that address.
+On x64, `callp` uses a `call` instruction that pushes the return address on
+the JIT stack; `jit_return_address` points to that slot so the trampoline can
+redirect the return.
 
-On ARM64, the link register (x30/LR) holds return addresses instead of the
-stack. The trampoline must:
+On ARM64, `blr` puts the return address in LR (x30), not the stack. The
+x64 slot-redirect approach doesn't apply, so we use a scratch copy instead:
 
-1. At JIT entry: save LR into `tc->jit_return_address` (after the prologue
-   saves it to the stack, so it is preserved across calls).
-2. When deopt/runbytecode is needed: `ldr x30, TC->jit_return_address; ret`
-   (or equivalent).
+- **Prologue** (when `!jg->no_trampoline`):
+  - Save LR to `[sp+40]` — the scratch copy slot (never restored by epilogue).
+  - `tc->jit_return_address = sp+40`.
+- **Epilogue**: clear `tc->jit_return_address = NULL`.
+  `ldp x29, x30, [sp], #80` restores the **original** saved LR from `[sp+8]`
+  (not `[sp+40]`), so trampoline overwrites to `[sp+40]` don't cause loops.
 
-Once the trampoline is working, remove `no_trampoline = 1` from graph
-construction and from the test.
+Limitation: `callp` does not update `[sp+40]` before each `blr`, so
+`*jit_return_address` remains the outer LR rather than a per-callp JIT
+position. This means `MVM_jit_code_get_current_position` may return an
+imprecise address when called from inside a C helper. Exception re-entry
+via JIT is therefore not yet precise — a known gap, deferred to a later
+milestone.
+
+`no_trampoline = 1` removed from both test files. All 19 tests still pass.
 
 ---
 

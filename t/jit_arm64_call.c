@@ -66,7 +66,6 @@ static MVMJitCode *build_call_graph(MVMThreadContext *tc,
 
     jg->sg            = sg;
     jg->num_labels    = 1;
-    jg->no_trampoline = 1;
 
     label_node->type         = MVM_JIT_NODE_LABEL;
     label_node->u.label.name = 0;

@@ -59,7 +59,6 @@ int main(int argc, char **argv) {
     memset(&jg, 0, sizeof(jg));
     jg.sg            = &fake_sg;
     jg.num_labels    = 1;
-    jg.no_trampoline = 1;
 
     memset(&label_node, 0, sizeof(label_node));
     label_node.type         = MVM_JIT_NODE_LABEL;

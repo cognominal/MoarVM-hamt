@@ -139,14 +139,17 @@ const unsigned char * MVM_jit_actions(void) {
  *
  * Stack frame layout (80 bytes, 16-byte aligned):
  *   [sp+ 0]: x29 (saved FP)
- *   [sp+ 8]: x30 (saved LR)
+ *   [sp+ 8]: x30 (saved LR  — outer return address, restored by epilogue)
  *   [sp+16]: x19 (saved TC caller value)
  *   [sp+24]: x20 (saved CU caller value)
  *   [sp+32]: x21 (saved WORK caller value)
- *   [sp+40..79]: scratch / spill space
+ *   [sp+40]: scratch copy of LR for jit_return_address
+ *   [sp+48..79]: available for spills / C call stack args
  *
- * NOTE: jit_return_address trampoline not yet implemented for ARM64.
- *       TC->jit_return_address is left as-is (typically NULL).
+ * Trampoline: tc->jit_return_address points to [sp+40].
+ * MVM_jit_code_trampoline may overwrite [sp+40] with exit_label and set
+ * jit_return_address=NULL. The epilogue restores LR from [sp+8] (untouched),
+ * so the trampoline redirect only affects what the caller finds in [sp+40].
  * ----------------------------------------------------------------------- */
 void MVM_jit_emit_prologue(MVMThreadContext *tc, MVMJitCompiler *compiler,
                            MVMJitGraph *jg) {
@@ -160,17 +163,27 @@ void MVM_jit_emit_prologue(MVMThreadContext *tc, MVMJitCompiler *compiler,
     | mov x20, ARG2
     | ldr TMP1, TC->cur_frame
     | ldr x21, FRAME:TMP1->work
+    /* Trampoline: save outer LR copy to [sp+40]; point jit_return_address there */
+    if (!jg->no_trampoline) {
+        | str x30, [sp, #40]
+        | add TMP1, sp, #40
+        | str TMP1, TC->jit_return_address
+    }
     /* Jump to the continuation label supplied by the caller */
     | br ARG3
 }
 
 /* ---- Epilogue ------------------------------------------------------------
  * The ->exit global label is the single exit point for all JIT code.
- * Restores callee-saved registers and returns to the C caller.
+ * Clears jit_return_address, restores callee-saved registers and
+ * returns to the C caller via the original saved LR at [sp+8].
  * ----------------------------------------------------------------------- */
 void MVM_jit_emit_epilogue(MVMThreadContext *tc, MVMJitCompiler *compiler,
                            MVMJitGraph *jg) {
     | ->exit:
+    if (!jg->no_trampoline) {
+        | str xzr, TC->jit_return_address
+    }
     | ldr x21, [sp, #32]
     | ldp x19, x20, [sp, #16]
     | ldp x29, x30, [sp], #80
