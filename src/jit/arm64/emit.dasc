@@ -27,6 +27,23 @@
 |.type REPR,       MVMREPROps
 |.type MVMDISPINLINECACHE, MVMDispInlineCache
 |.type MVMDISPINLINECACHEENTRY, MVMDispInlineCacheEntry
+|.type COLLECTABLE, MVMCollectable
+|.type REGISTER,   MVMRegister
+|.type P6OPAQUE,   MVMP6opaque
+|.type P6OBODY,    MVMP6opaqueBody
+|.type CONTEXT,    MVMContext
+|.type HLLCONFIG,  MVMHLLConfig
+|.type BIGINTBODY, MVMP6bigintBody
+|.type ARGCTX,     MVMArgProcContext
+|.type CALLSITE,   MVMCallsite
+|.type U16,        MVMuint16
+|.type SCREF,      MVMSerializationContext
+|.type SCREFBODY,  MVMSerializationContextBody
+|.type MVMITER,    MVMIter
+|.type CONTAINERSPEC, MVMContainerSpec
+|.type STORAGESPEC, MVMStorageSpec
+|.type MVMACTIVEHANDLERS, MVMActiveHandler
+|.type STRING, MVMString
 
 /* ---- Register conventions ------------------------------------------------
  * x0-x7  : ARG1-ARG8 / caller-saved
@@ -72,7 +89,12 @@
 |.quad (uintptr_t)(funcptr)
 |.code
 | ldr FUNCTION, <5
+| adr x17, >9
+| str x17, [sp, #40]
 | blr FUNCTION
+| ldr x17, [sp, #40]
+| br x17
+|9:
 |.endmacro
 
 /* GC safe-point: if gc_status != 0, call into the GC. */
@@ -122,6 +144,40 @@
 | ldr out, STABLE:out->REPR
 |.endmacro
 
+/* Write barrier: skip if root not gen2, ref null, or ref already gen2 */
+|.macro check_wb, root, ref, lbl
+| ldrb w17, COLLECTABLE:root->flags2
+| tbz x17, #1, lbl
+| cbz ref, lbl
+| ldrb w17, COLLECTABLE:ref->flags2
+| tbnz x17, #1, lbl
+|.endmacro
+
+|.macro hit_wb, obj, value
+| mov ARG3, value
+| mov ARG2, obj
+| mov ARG1, x19
+| callp &MVM_gc_write_barrier_hit_by
+|.endmacro
+
+|.macro throw_adhoc, msg
+| mov ARG1, x19
+|.data
+|6:
+| .quad (uintptr_t)(msg)
+|.code
+| ldr ARG2, <6
+| callp &MVM_exception_throw_adhoc
+|.endmacro
+
+|.macro cmp_repr_id, obj, tmp, id
+| get_repr tmp, obj
+| ldr w17, REPR:tmp->ID
+| cmp w17, #id
+|.endmacro
+
+
+#define WORK_OFF(r) ((MVMint32)((r) * (MVMint32)sizeof(MVMRegister)))
 
 MVMint32 MVM_jit_support(void) {
     return 1;
@@ -137,24 +193,27 @@ const unsigned char * MVM_jit_actions(void) {
  * saves callee-saved registers, loads TC/CU/WORK, then jumps to the
  * entry label passed in as ARG3 (x2).
  *
- * Stack frame layout (80 bytes, 16-byte aligned):
- *   [sp+ 0]: x29 (saved FP)
- *   [sp+ 8]: x30 (saved LR  — outer return address, restored by epilogue)
- *   [sp+16]: x19 (saved TC caller value)
- *   [sp+24]: x20 (saved CU caller value)
- *   [sp+32]: x21 (saved WORK caller value)
- *   [sp+40]: scratch copy of LR for jit_return_address
- *   [sp+48..79]: available for spills / C call stack args
+ * Stack frame layout (160 bytes, 16-byte aligned):
+ *   [sp+  0]: x29 (saved FP)
+ *   [sp+  8]: x30 (saved LR  — outer return address, restored by epilogue)
+ *   [sp+ 16]: x19 (saved TC caller value)
+ *   [sp+ 24]: x20 (saved CU caller value)
+ *   [sp+ 32]: x21 (saved WORK caller value)
+ *   [sp+ 40]: trampoline slot (jit_return_address points here)
+ *   [sp+ 48]: MVMArgs.callsite   } pre-allocated for runccode/runbytecode
+ *   [sp+ 56]: MVMArgs.source     }   so those functions never adjust sp,
+ *   [sp+ 64]: MVMArgs.map        }   keeping [sp+40] as the live trampoline
+ *   [sp+ 72]: padding            }   slot for callp.
+ *   [sp+ 80..159]: reserved (unused; formerly held arg_indices)
  *
- * Trampoline: tc->jit_return_address points to [sp+40].
- * MVM_jit_code_trampoline may overwrite [sp+40] with exit_label and set
- * jit_return_address=NULL. The epilogue restores LR from [sp+8] (untouched),
- * so the trampoline redirect only affects what the caller finds in [sp+40].
+ * Trampoline: tc->jit_return_address = &sp[40].  callp stores its reentry
+ * label at [sp+40]; MVM_jit_code_trampoline overwrites it with exit_label.
+ * The epilogue restores LR from [sp+8] (never touched by the trampoline).
  * ----------------------------------------------------------------------- */
 void MVM_jit_emit_prologue(MVMThreadContext *tc, MVMJitCompiler *compiler,
                            MVMJitGraph *jg) {
     |.code
-    | stp x29, x30, [sp, #-80]!
+    | stp x29, x30, [sp, #-160]!
     | mov x29, sp
     | stp x19, x20, [sp, #16]
     | str x21, [sp, #32]
@@ -186,7 +245,7 @@ void MVM_jit_emit_epilogue(MVMThreadContext *tc, MVMJitCompiler *compiler,
     }
     | ldr x21, [sp, #32]
     | ldp x19, x20, [sp, #16]
-    | ldp x29, x30, [sp], #80
+    | ldp x29, x30, [sp], #160
     | ret
 }
 
@@ -214,7 +273,86 @@ void MVM_jit_emit_block_branch(MVMThreadContext *tc, MVMJitCompiler *compiler,
             | b =>(name)
         }
     } else {
-        MVM_oops(tc, "ARM64 JIT: conditional block branch not yet implemented");
+        MVMint16 val = ins->operands[0].reg.orig;
+        MVMint32 val_off = WORK_OFF(val);
+        switch (ins->info->opcode) {
+        case MVM_OP_if_i:
+            | ldr TMP1, [x21, #val_off]
+            | cbnz TMP1, =>(name)
+            break;
+        case MVM_OP_unless_i:
+            | ldr TMP1, [x21, #val_off]
+            | cbz TMP1, =>(name)
+            break;
+        case MVM_OP_if_n:
+            | ldr d0, [x21, #val_off]
+            | fcmp d0, #0.0
+            | bvs =>(name)
+            | bne =>(name)
+            break;
+        case MVM_OP_unless_n:
+            | ldr d0, [x21, #val_off]
+            | fcmp d0, #0.0
+            | bvs >1
+            | bne >1
+            | b =>(name)
+            |1:
+            break;
+        case MVM_OP_if_s0:
+        case MVM_OP_unless_s0:
+            | mov ARG1, x19
+            | ldr ARG2, [x21, #val_off]
+            | callp &MVM_coerce_istrue_s
+            if (ins->info->opcode == MVM_OP_unless_s0) {
+                | cbz RV, =>(name)
+            } else {
+                | cbnz RV, =>(name)
+            }
+            break;
+        case MVM_OP_if_s:
+            | ldr TMP1, [x21, #val_off]
+            | cbz TMP1, >1
+            | ldr w9, STRING:TMP1->body.num_graphs
+            | cbz x9, >1
+            | b =>(name)
+            |1:
+            break;
+        case MVM_OP_unless_s:
+            | ldr TMP1, [x21, #val_off]
+            | cbz TMP1, =>(name)
+            | ldr w9, STRING:TMP1->body.num_graphs
+            | cbz x9, =>(name)
+            break;
+        case MVM_OP_ifnonnull:
+            | ldr TMP1, [x21, #val_off]
+            | cbz TMP1, >1
+            | get_vmnull TMP2
+            | cmp TMP1, TMP2
+            | beq >1
+            | b =>(name)
+            |1:
+            break;
+        case MVM_OP_indexat:
+        case MVM_OP_indexnat: {
+            MVMint16 offset  = ins->operands[1].reg.orig;
+            MVMuint32 str_idx = ins->operands[2].lit_str_idx;
+            MVMint32 off_off = WORK_OFF(offset);
+            | mov ARG1, x19
+            | ldr ARG2, [x21, #val_off]
+            | ldr ARG3, [x21, #off_off]
+            | get_string ARG4, str_idx
+            | callp &MVM_string_char_at_in_string
+            | cmn RV, #1
+            if (ins->info->opcode == MVM_OP_indexat) {
+                | ble =>(name)
+            } else {
+                | bne =>(name)
+            }
+            break;
+        }
+        default:
+            MVM_oops(tc, "ARM64 JIT: can't handle conditional branch <%s>", ins->info->name);
+        }
     }
 }
 
@@ -411,10 +549,13 @@ static void emit_fpr_arg(MVMThreadContext *tc, MVMJitCompiler *compiler, MVMint3
     }
 }
 
-static void emit_arm64_callargs(MVMThreadContext *tc, MVMJitCompiler *compiler,
-                                MVMJitGraph *jg, MVMJitCallArg args[], MVMint32 num_args) {
-    MVMint32 num_gpr = 0, num_fpr = 0, i;
-    MVMJitCallArg in_gpr[8], in_fpr[8];
+/* Returns the sp adjustment made for stack args (must be undone by caller after
+ * the call).  call_c operations that don't dispatch MoarVM frames use blr
+ * directly, so sp adjustment here is safe. */
+static MVMint32 emit_arm64_callargs(MVMThreadContext *tc, MVMJitCompiler *compiler,
+                                    MVMJitGraph *jg, MVMJitCallArg args[], MVMint32 num_args) {
+    MVMint32 num_gpr = 0, num_fpr = 0, num_stack = 0, i;
+    MVMJitCallArg in_gpr[8], in_fpr[8], in_stack[8];
 
     for (i = 0; i < num_args; i++) {
         switch (args[i].type) {
@@ -441,7 +582,8 @@ static void emit_arm64_callargs(MVMThreadContext *tc, MVMJitCompiler *compiler,
         case MVM_JIT_SPESH_SLOT_VALUE:
         case MVM_JIT_STACK_VALUE:
             if (num_gpr < 8) in_gpr[num_gpr++] = args[i];
-            else MVM_oops(tc, "ARM64 JIT: too many GPR arguments");
+            else if (num_stack < 8) in_stack[num_stack++] = args[i];
+            else MVM_oops(tc, "ARM64 JIT: too many GPR arguments (max 16)");
             break;
         case MVM_JIT_ARG_DOUBLE:
         case MVM_JIT_PARAM_DOUBLE:
@@ -463,6 +605,19 @@ static void emit_arm64_callargs(MVMThreadContext *tc, MVMJitCompiler *compiler,
         load_call_arg(tc, compiler, jg, in_fpr[i]);
         emit_fpr_arg(tc, compiler, i);
     }
+
+    /* Stack args (AAPCS64: extra args at [SP+0], [SP+8], ... at call time).
+     * These functions don't dispatch MoarVM frames, so adjusting sp is safe. */
+    MVMint32 stack_frame_size = 0;
+    if (num_stack > 0) {
+        stack_frame_size = (num_stack * 8 + 15) & ~15;
+        | sub sp, sp, #stack_frame_size
+        for (i = 0; i < num_stack; i++) {
+            load_call_arg(tc, compiler, jg, in_stack[i]);
+            | str TMP6, [sp, #(i * 8)]
+        }
+    }
+    return stack_frame_size;
 }
 
 /* ARM64 register class helpers.
@@ -472,17 +627,2105 @@ static void emit_arm64_callargs(MVMThreadContext *tc, MVMJitCompiler *compiler,
 #define ARM64_GPR_NUM(x) ((x))
 #define ARM64_FPR_NUM(x) ((x) - 31)
 
-/* ---- Stubs for unimplemented emitters ----------------------------------- */
+/* ---- Helpers for emit_primitive ----------------------------------------- */
+
+static void arm64_mov64_tmp1(MVMThreadContext *tc, MVMJitCompiler *compiler, MVMuint64 val) {
+    MVMuint32 c0 = (MVMuint32)(val         & 0xFFFFu);
+    MVMuint32 c1 = (MVMuint32)((val >> 16) & 0xFFFFu);
+    MVMuint32 c2 = (MVMuint32)((val >> 32) & 0xFFFFu);
+    MVMuint32 c3 = (MVMuint32)((val >> 48) & 0xFFFFu);
+    | movz x9, #c0
+    if (c1)
+        | movk x9, #c1, lsl #16
+    if (c2)
+        | movk x9, #c2, lsl #32
+    if (c3)
+        | movk x9, #c3, lsl #48
+}
+
+static int arm64_try_emit_gen2_ref(MVMThreadContext *tc, MVMJitCompiler *compiler,
+                                    MVMJitGraph *jg, MVMObject *obj, MVMint16 reg) {
+    if (!(obj->header.flags2 & MVM_CF_SECOND_GEN))
+        return 0;
+    MVMint32 dst_off = WORK_OFF(reg);
+    arm64_mov64_tmp1(tc, compiler, (MVMuint64)(uintptr_t)obj);
+    | str TMP1, [x21, #dst_off]
+    return 1;
+}
+
+static void arm64_emit_fastcreate(MVMThreadContext *tc, MVMJitCompiler *compiler,
+                                   MVMJitGraph *jg, MVMSpeshIns *ins) {
+    MVMuint16 size     = ins->operands[1].lit_i16;
+    MVMint16 spesh_idx = ins->operands[2].lit_i16;
+    | mov ARG1, x19
+    | mov ARG2, #size
+    | callp &MVM_gc_allocate_nursery
+    | get_spesh_slot TMP1, spesh_idx
+    | str TMP1, OBJECT:RV->st
+    | movz w10, #size
+    | strh w10, OBJECT:RV->header.size
+    | ldr w10, TC->thread_id
+    | str w10, OBJECT:RV->header.owner
+}
 
 void MVM_jit_emit_primitive(MVMThreadContext *tc, MVMJitCompiler *compiler,
-                            MVMJitGraph *jg, MVMJitPrimitive *prim) {
-    MVM_oops(tc, "ARM64 JIT: emit_primitive not yet implemented");
+                             MVMJitGraph *jg, MVMJitPrimitive *prim) {
+    MVMSpeshIns *ins = prim->ins;
+    MVMuint16 op = ins->info->opcode;
+    switch (op) {
+    case MVM_OP_const_i64_16:
+    case MVM_OP_const_i64_32: {
+        MVMint32 reg = ins->operands[0].reg.orig;
+        MVMint64 val = (op == MVM_OP_const_i64_16 ? (MVMint64)ins->operands[1].lit_i16
+                                                   : (MVMint64)ins->operands[1].lit_i32);
+        MVMint32 dst_off = WORK_OFF(reg);
+        arm64_mov64_tmp1(tc, compiler, (MVMuint64)val);
+        | str TMP1, [x21, #dst_off]
+        break;
+    }
+    case MVM_OP_const_i64: {
+        MVMint32 reg = ins->operands[0].reg.orig;
+        MVMint64 val = ins->operands[1].lit_i64;
+        MVMint32 dst_off = WORK_OFF(reg);
+        arm64_mov64_tmp1(tc, compiler, (MVMuint64)val);
+        | str TMP1, [x21, #dst_off]
+        break;
+    }
+    case MVM_OP_const_n64: {
+        MVMint16 reg = ins->operands[0].reg.orig;
+        MVMint64 valbytes = ins->operands[1].lit_i64;
+        MVMint32 dst_off = WORK_OFF(reg);
+        arm64_mov64_tmp1(tc, compiler, (MVMuint64)valbytes);
+        | str TMP1, [x21, #dst_off]
+        break;
+    }
+    case MVM_OP_inf:
+    case MVM_OP_neginf:
+    case MVM_OP_nan: {
+        MVMint16 reg = ins->operands[0].reg.orig;
+        MVMint32 dst_off = WORK_OFF(reg);
+        MVMRegister tmp;
+        if (op == MVM_OP_nan)
+            tmp.n64 = MVM_num_nan(tc);
+        else if (op == MVM_OP_inf)
+            tmp.n64 = MVM_num_posinf(tc);
+        else
+            tmp.n64 = MVM_num_neginf(tc);
+        arm64_mov64_tmp1(tc, compiler, (MVMuint64)tmp.i64);
+        | str TMP1, [x21, #dst_off]
+        break;
+    }
+    case MVM_OP_const_s: {
+        MVMint16 reg = ins->operands[0].reg.orig;
+        MVMuint32 idx = ins->operands[1].lit_str_idx;
+        MVMStaticFrame *sf = jg->sg->sf;
+        MVMString *s = MVM_cu_string(tc, sf->body.cu, idx);
+        if (!arm64_try_emit_gen2_ref(tc, compiler, jg, (MVMObject*)s, reg)) {
+            MVMint32 dst_off = WORK_OFF(reg);
+            | get_string TMP1, idx
+            | str TMP1, [x21, #dst_off]
+        }
+        break;
+    }
+    case MVM_OP_null:
+    case MVM_OP_sp_resumption: {
+        MVMint16 reg = ins->operands[0].reg.orig;
+        MVMint32 dst_off = WORK_OFF(reg);
+        | get_vmnull TMP1
+        | str TMP1, [x21, #dst_off]
+        break;
+    }
+    case MVM_OP_getwhat:
+    case MVM_OP_getwho: {
+        MVMint16 dst = ins->operands[0].reg.orig;
+        MVMint16 obj = ins->operands[1].reg.orig;
+        MVMint32 obj_off = WORK_OFF(obj);
+        MVMint32 dst_off = WORK_OFF(dst);
+        | ldr TMP1, [x21, #obj_off]
+        | ldr TMP1, OBJECT:TMP1->st
+        if (op == MVM_OP_getwho) {
+            | ldr TMP1, STABLE:TMP1->WHO
+            | cbnz TMP1, >1
+            | get_vmnull TMP1
+            |1:
+        } else {
+            | ldr TMP1, STABLE:TMP1->WHAT
+        }
+        | str TMP1, [x21, #dst_off]
+        break;
+    }
+    case MVM_OP_getlex:
+    case MVM_OP_sp_getlex_o:
+    case MVM_OP_sp_getlex_ins: {
+        MVMuint16 *lexical_types;
+        MVMStaticFrame *sf = jg->sg->sf;
+        MVMint16 dst = ins->operands[0].reg.orig;
+        MVMint16 idx = ins->operands[1].lex.idx;
+        MVMint16 out = ins->operands[1].lex.outers;
+        MVMint16 i;
+        MVMint32 dst_off = WORK_OFF(dst);
+        | ldr TMP6, TC->cur_frame
+        for (i = 0; i < out; i++) {
+            | ldr TMP6, FRAME:TMP6->outer
+            sf = sf->body.outer;
+        }
+        /* NB: the DynASM form `FRAME:TMP1->env` silently emits no
+         * instruction here, so load env via an explicit offsetof. */
+        | ldr TMP5, [TMP6, #offsetof(MVMFrame, env)]
+        {
+            MVMint32 env_off = idx * (MVMint32)sizeof(MVMRegister);
+            | ldr TMP5, [TMP5, #env_off]
+        }
+        lexical_types = (!out && jg->sg->lexical_types ?
+                         jg->sg->lexical_types :
+                         sf->body.lexical_types);
+        if (lexical_types[idx] == MVM_reg_obj) {
+            | cbnz TMP5, >1
+            | mov ARG1, x19
+            | mov ARG2, TMP6
+            | mov ARG3, #idx
+            | callp &MVM_frame_vivify_lexical
+            | mov TMP5, RV
+            |1:
+        }
+        | str TMP5, [x21, #dst_off]
+        break;
+    }
+    case MVM_OP_sp_getlexvia_o:
+    case MVM_OP_sp_getlexvia_ins: {
+        MVMint16 dst = ins->operands[0].reg.orig;
+        MVMint16 idx = ins->operands[1].lit_ui16;
+        MVMint16 out = ins->operands[2].lit_ui16;
+        MVMint16 via = ins->operands[3].reg.orig;
+        MVMint16 i;
+        MVMint32 dst_off = WORK_OFF(dst);
+        MVMint32 via_off = WORK_OFF(via);
+        | ldr TMP6, [x21, #via_off]
+        | ldr TMP6, CODE:TMP6->body.outer
+        for (i = 1; i < out; i++)
+            | ldr TMP6, FRAME:TMP6->outer
+        /* NB: the DynASM form `FRAME:TMP6->env` silently emits no
+         * instruction here, so load env via an explicit offsetof. */
+        | ldr TMP5, [TMP6, #offsetof(MVMFrame, env)]
+        {
+            MVMint32 env_off = idx * (MVMint32)sizeof(MVMRegister);
+            | ldr TMP5, [TMP5, #env_off]
+        }
+        if (op == MVM_OP_sp_getlexvia_o) {
+            | cbnz TMP5, >1
+            | mov ARG1, x19
+            | mov ARG2, TMP6
+            | mov ARG3, #idx
+            | callp &MVM_frame_vivify_lexical
+            | mov TMP5, RV
+            |1:
+        }
+        | str TMP5, [x21, #dst_off]
+        break;
+    }
+    case MVM_OP_sp_bindlexvia_os:
+    case MVM_OP_sp_bindlexvia_in: {
+        MVMint16 idx = ins->operands[0].lit_ui16;
+        MVMint16 out = ins->operands[1].lit_ui16;
+        MVMint16 via = ins->operands[2].reg.orig;
+        MVMint16 src = ins->operands[3].reg.orig;
+        MVMint16 i;
+        MVMint32 via_off = WORK_OFF(via);
+        MVMint32 src_off = WORK_OFF(src);
+        MVMint32 env_off = idx * (MVMint32)sizeof(MVMRegister);
+        | ldr TMP1, [x21, #via_off]
+        | ldr TMP1, CODE:TMP1->body.outer
+        for (i = 1; i < out; i++)
+            | ldr TMP1, FRAME:TMP1->outer
+        /* NB: the DynASM form `FRAME:TMP1->env` silently emits no
+         * instruction here, so load env via an explicit offsetof. */
+        | ldr TMP2, [TMP1, #offsetof(MVMFrame, env)]
+        | ldr TMP3, [x21, #src_off]
+        | str TMP3, [TMP2, #env_off]
+        if (op == MVM_OP_sp_bindlexvia_os) {
+            | check_wb TMP1, TMP3, >2
+            | hit_wb TMP1, TMP3
+            |2:
+        }
+        break;
+    }
+    case MVM_OP_getlexrel: {
+        MVMint16 dst  = ins->operands[0].reg.orig;
+        MVMint16 ctx  = ins->operands[1].reg.orig;
+        MVMint16 name = ins->operands[2].reg.orig;
+        MVMint32 dst_off  = WORK_OFF(dst);
+        MVMint32 ctx_off  = WORK_OFF(ctx);
+        MVMint32 name_off = WORK_OFF(name);
+        | ldr TMP5, [x21, #ctx_off]
+        | cmp_repr_id TMP5, TMP6, MVM_REPR_ID_MVMContext
+        | beq >1
+        | test_type_object TMP5
+        | beq >1
+        | throw_adhoc "getlexrel needs a context"
+        |1:
+        | mov ARG1, x19
+        | mov ARG2, TMP5
+        | ldr ARG3, [x21, #name_off]
+        | callp &MVM_context_lexical_lookup
+        | str RV, [x21, #dst_off]
+        break;
+    }
+    case MVM_OP_getlexreldyn: {
+        MVMint16 dst  = ins->operands[0].reg.orig;
+        MVMint16 ctx  = ins->operands[1].reg.orig;
+        MVMint16 name = ins->operands[2].reg.orig;
+        MVMint32 dst_off  = WORK_OFF(dst);
+        MVMint32 ctx_off  = WORK_OFF(ctx);
+        MVMint32 name_off = WORK_OFF(name);
+        | ldr TMP5, [x21, #ctx_off]
+        | cmp_repr_id TMP5, TMP6, MVM_REPR_ID_MVMContext
+        | beq >1
+        | test_type_object TMP5
+        | beq >1
+        | throw_adhoc "getlexreldyn needs a context"
+        |1:
+        | mov ARG1, x19
+        | mov ARG2, TMP5
+        | ldr ARG3, [x21, #name_off]
+        | callp &MVM_context_dynamic_lookup
+        | str RV, [x21, #dst_off]
+        break;
+    }
+    case MVM_OP_getlexrelcaller: {
+        MVMint16 dst  = ins->operands[0].reg.orig;
+        MVMint16 ctx  = ins->operands[1].reg.orig;
+        MVMint16 name = ins->operands[2].reg.orig;
+        MVMint32 dst_off  = WORK_OFF(dst);
+        MVMint32 ctx_off  = WORK_OFF(ctx);
+        MVMint32 name_off = WORK_OFF(name);
+        | ldr TMP5, [x21, #ctx_off]
+        | cmp_repr_id TMP5, TMP6, MVM_REPR_ID_MVMContext
+        | beq >1
+        | test_type_object TMP5
+        | beq >1
+        | throw_adhoc "getlexrelcaller needs a context"
+        |1:
+        | mov ARG1, x19
+        | mov ARG2, TMP5
+        | ldr ARG3, [x21, #name_off]
+        | callp &MVM_context_caller_lookup
+        | str RV, [x21, #dst_off]
+        break;
+    }
+    case MVM_OP_getlex_no:
+    case MVM_OP_sp_getlex_no: {
+        MVMint16 dst = ins->operands[0].reg.orig;
+        MVMuint32 idx = ins->operands[1].lit_str_idx;
+        MVMint32 dst_off = WORK_OFF(dst);
+        | mov ARG1, x19
+        | get_string ARG2, idx
+        | mov ARG3, #MVM_reg_obj
+        | callp &MVM_frame_find_lexical_by_name
+        | cbz RV, >1
+        | ldr RV, [RV]
+        | str RV, [x21, #dst_off]
+        | b >2
+        |1:
+        | get_vmnull TMP3
+        | str TMP3, [x21, #dst_off]
+        |2:
+        break;
+    }
+    case MVM_OP_bindlex:
+    case MVM_OP_sp_bindlex_os:
+    case MVM_OP_sp_bindlex_in: {
+        MVMuint16 *lexical_types;
+        MVMStaticFrame *sf = jg->sg->sf;
+        MVMint16 idx = ins->operands[0].lex.idx;
+        MVMint16 out = ins->operands[0].lex.outers;
+        MVMint16 src = ins->operands[1].reg.orig;
+        MVMint16 i;
+        MVMint32 src_off = WORK_OFF(src);
+        MVMint32 env_off = idx * (MVMint32)sizeof(MVMRegister);
+        | ldr TMP1, TC->cur_frame
+        for (i = 0; i < out; i++) {
+            | ldr TMP1, FRAME:TMP1->outer
+            sf = sf->body.outer;
+        }
+        lexical_types = (!out && jg->sg->lexical_types ?
+                         jg->sg->lexical_types :
+                         sf->body.lexical_types);
+        /* NB: the DynASM form `FRAME:TMP1->env` silently emits no
+         * instruction here, so load env via an explicit offsetof. */
+        | ldr TMP2, [TMP1, #offsetof(MVMFrame, env)]
+        | ldr TMP3, [x21, #src_off]
+        | str TMP3, [TMP2, #env_off]
+        if (lexical_types[idx] == MVM_reg_obj || lexical_types[idx] == MVM_reg_str) {
+            | check_wb TMP1, TMP3, >2
+            | hit_wb TMP1, TMP3
+            |2:
+        }
+        break;
+    }
+    case MVM_OP_lexprimspec: {
+        MVMint16 dst  = ins->operands[0].reg.orig;
+        MVMint16 ctx  = ins->operands[1].reg.orig;
+        MVMint16 name = ins->operands[2].reg.orig;
+        MVMint32 dst_off  = WORK_OFF(dst);
+        MVMint32 ctx_off  = WORK_OFF(ctx);
+        MVMint32 name_off = WORK_OFF(name);
+        | ldr TMP1, [x21, #ctx_off]
+        | cmp_repr_id TMP1, TMP2, MVM_REPR_ID_MVMContext
+        | bne >1
+        | test_type_object TMP1
+        | bne >2
+        |1:
+        | throw_adhoc "lexprimspec needs a context"
+        |2:
+        | ldr ARG2, CONTEXT:TMP1->body.context
+        | ldr ARG3, [x21, #name_off]
+        | mov ARG1, x19
+        | callp &MVM_frame_lexical_primspec
+        | str RV, [x21, #dst_off]
+        break;
+    }
+    case MVM_OP_sp_getarg_o:
+    case MVM_OP_sp_getarg_n:
+    case MVM_OP_sp_getarg_s:
+    case MVM_OP_sp_getarg_u:
+    case MVM_OP_sp_getarg_i: {
+        MVMint32 reg = ins->operands[0].reg.orig;
+        MVMuint16 idx = ins->operands[1].callsite_idx;
+        MVMint32 dst_off = WORK_OFF(reg);
+        MVMint32 map_off = (MVMint32)(idx * sizeof(MVMuint16));
+        | ldr TMP1, TC->cur_frame
+        | ldr TMP2, FRAME:TMP1->params.arg_info.map
+        | ldrh w10, [TMP2, #map_off]
+        | ldr TMP1, FRAME:TMP1->params.arg_info.source
+        | ldr TMP1, [TMP1, TMP2, lsl #3]
+        | str TMP1, [x21, #dst_off]
+        break;
+    }
+    case MVM_OP_sp_p6oget_i:
+    case MVM_OP_sp_p6oget_u:
+    case MVM_OP_sp_p6oget_i32:
+    case MVM_OP_sp_p6oget_u32:
+    case MVM_OP_sp_p6oget_n:
+    case MVM_OP_sp_p6oget_s:
+    case MVM_OP_sp_p6oget_bi:
+    case MVM_OP_sp_p6oget_o:
+    case MVM_OP_sp_p6ogetvc_o:
+    case MVM_OP_sp_p6ogetvt_o:
+    case MVM_OP_sp_getvc_o:
+    case MVM_OP_sp_getvt_o: {
+        MVMint16 dst    = ins->operands[0].reg.orig;
+        MVMint16 obj    = ins->operands[1].reg.orig;
+        MVMint32 body   = (MVMint32)offsetof(MVMP6opaque, body);
+        MVMint16 offset = ins->operands[2].lit_i16;
+        MVMint32 obj_off = WORK_OFF(obj);
+        MVMint32 dst_off = WORK_OFF(dst);
+        | ldr TMP1, [x21, #obj_off]
+        if (op == MVM_OP_sp_getvc_o || op == MVM_OP_sp_getvt_o) {
+            /* address = object + offset (no body indirection) */
+            | add TMP2, TMP1, #offset
+        } else {
+            /* address = object->body + offset, or replaced->offset */
+            MVMint32 base_off = body + offset;
+            | add TMP2, TMP1, #base_off
+            | ldr TMP4, P6OPAQUE:TMP1->body.replaced
+            | cbz TMP4, >1
+            | add TMP2, TMP4, #offset
+            |1:
+        }
+        if (op == MVM_OP_sp_p6oget_o) {
+            | ldr TMP3, [TMP2]
+            | cbnz TMP3, >3
+            | get_vmnull TMP3
+            |3:
+        } else if (op == MVM_OP_sp_p6ogetvt_o || op == MVM_OP_sp_getvt_o) {
+            MVMint16 spesh_idx = ins->operands[3].lit_i16;
+            MVMCollectable *spesh_value = jg->sg->spesh_slots[spesh_idx];
+            | ldr TMP3, [TMP2]
+            | cbnz TMP3, >4
+            | get_spesh_slot TMP3, spesh_idx
+            if (!(spesh_value->flags2 & MVM_CF_SECOND_GEN)) {
+                | check_wb TMP1, TMP3, >3
+                /* spill TMP2 and TMP3 around write barrier call */
+                | stp TMP2, TMP3, [sp, #48]
+                | mov ARG1, x19
+                | ldr ARG2, [x21, #obj_off]
+                | mov ARG3, TMP3
+                | callp &MVM_gc_write_barrier_hit_by
+                | ldp TMP2, TMP3, [sp, #48]
+                |3:
+            }
+            | str TMP3, [TMP2]
+            |4:
+        } else if (op == MVM_OP_sp_p6ogetvc_o || op == MVM_OP_sp_getvc_o) {
+            MVMint16 spesh_idx = ins->operands[3].lit_i16;
+            | ldr TMP3, [TMP2]
+            | cbnz TMP3, >4
+            | mov ARG1, x19
+            | get_spesh_slot ARG2, spesh_idx
+            | callp &MVM_repr_clone
+            | mov TMP3, RV
+            /* reload object and recompute address after callp */
+            | ldr TMP1, [x21, #obj_off]
+            if (op == MVM_OP_sp_getvc_o) {
+                | add TMP2, TMP1, #offset
+            } else {
+                MVMint32 base_off = body + offset;
+                | add TMP2, TMP1, #base_off
+                | ldr TMP4, P6OPAQUE:TMP1->body.replaced
+                | cbz TMP4, >5
+                | add TMP2, TMP4, #offset
+                |5:
+            }
+            | check_wb TMP1, TMP3, >3
+            | stp TMP2, TMP3, [sp, #48]
+            | mov ARG1, x19
+            | ldr ARG2, [x21, #obj_off]
+            | mov ARG3, TMP3
+            | callp &MVM_gc_write_barrier_hit_by
+            | ldp TMP2, TMP3, [sp, #48]
+            |3:
+            | str TMP3, [TMP2]
+            |4:
+        } else if (op == MVM_OP_sp_p6oget_bi) {
+            /* big integer body */
+            | ldr w9, BIGINTBODY:TMP2->u.smallint.flag
+            | cmp w9, #MVM_BIGINT_32_FLAG
+            | bne >5
+            | ldrsw TMP3, BIGINTBODY:TMP2->u.smallint.value
+            | b >6
+            |5:
+            | mov ARG1, x19
+            | mov ARG2, TMP2
+            | callp &MVM_p6bigint_get_int64
+            | mov TMP3, RV
+            |6:
+        } else if (op == MVM_OP_sp_p6oget_i32) {
+            | ldrsw TMP3, [TMP2]
+        } else if (op == MVM_OP_sp_p6oget_u32) {
+            | ldr w11, [TMP2]
+        } else {
+            | ldr TMP3, [TMP2]
+        }
+        | str TMP3, [x21, #dst_off]
+        break;
+    }
+    case MVM_OP_sp_bind_i64:
+    case MVM_OP_sp_bind_u64:
+    case MVM_OP_sp_bind_i32:
+    case MVM_OP_sp_bind_u32:
+    case MVM_OP_sp_bind_n:
+    case MVM_OP_sp_bind_s:
+    case MVM_OP_sp_bind_s_nowb:
+    case MVM_OP_sp_bind_o: {
+        MVMint16 obj    = ins->operands[0].reg.orig;
+        MVMint16 offset = ins->operands[1].lit_i16;
+        MVMint16 val    = ins->operands[2].reg.orig;
+        MVMint32 obj_off = WORK_OFF(obj);
+        MVMint32 val_off = WORK_OFF(val);
+        | ldr TMP1, [x21, #obj_off]
+        | ldr TMP2, [x21, #val_off]
+        if (op == MVM_OP_sp_bind_o || op == MVM_OP_sp_bind_s) {
+            | check_wb TMP1, TMP2, >2
+            | hit_wb TMP1, TMP2
+            | ldr TMP1, [x21, #obj_off]
+            | ldr TMP2, [x21, #val_off]
+            |2:
+        }
+        if (op == MVM_OP_sp_bind_i32 || op == MVM_OP_sp_bind_u32) {
+            | str w10, [TMP1, #offset]
+        } else {
+            | str TMP2, [TMP1, #offset]
+        }
+        break;
+    }
+    case MVM_OP_sp_get_i64:
+    case MVM_OP_sp_get_u64:
+    case MVM_OP_sp_get_n:
+    case MVM_OP_sp_get_s: {
+        MVMint16 dst    = ins->operands[0].reg.orig;
+        MVMint16 obj    = ins->operands[1].reg.orig;
+        MVMint16 offset = ins->operands[2].lit_i16;
+        MVMint32 dst_off = WORK_OFF(dst);
+        MVMint32 obj_off = WORK_OFF(obj);
+        | ldr TMP1, [x21, #obj_off]
+        | ldr TMP2, [TMP1, #offset]
+        | str TMP2, [x21, #dst_off]
+        break;
+    }
+    case MVM_OP_sp_get_o: {
+        MVMint16 dst    = ins->operands[0].reg.orig;
+        MVMint16 obj    = ins->operands[1].reg.orig;
+        MVMint16 offset = ins->operands[2].lit_i16;
+        MVMint32 dst_off = WORK_OFF(dst);
+        MVMint32 obj_off = WORK_OFF(obj);
+        | ldr TMP1, [x21, #obj_off]
+        | ldr TMP2, [TMP1, #offset]
+        | cbnz TMP2, >1
+        | get_vmnull TMP2
+        |1:
+        | str TMP2, [x21, #dst_off]
+        break;
+    }
+    case MVM_OP_sp_get_u32:
+    case MVM_OP_sp_get_i32: {
+        MVMint16 dst    = ins->operands[0].reg.orig;
+        MVMint16 obj    = ins->operands[1].reg.orig;
+        MVMint16 offset = ins->operands[2].lit_i16;
+        MVMint32 dst_off = WORK_OFF(dst);
+        MVMint32 obj_off = WORK_OFF(obj);
+        | ldr TMP1, [x21, #obj_off]
+        if (op == MVM_OP_sp_get_i32) {
+            | ldrsw TMP2, [TMP1, #offset]
+        } else {
+            | ldr w10, [TMP1, #offset]
+        }
+        | str TMP2, [x21, #dst_off]
+        break;
+    }
+    case MVM_OP_sp_deref_bind_i64:
+    case MVM_OP_sp_deref_bind_n: {
+        MVMint16 obj    = ins->operands[0].reg.orig;
+        MVMint16 val    = ins->operands[1].reg.orig;
+        MVMint16 offset = ins->operands[2].lit_i16;
+        MVMint32 obj_off = WORK_OFF(obj);
+        MVMint32 val_off = WORK_OFF(val);
+        | ldr TMP1, [x21, #obj_off]
+        | ldr TMP2, [x21, #val_off]
+        | ldr TMP1, [TMP1, #offset]
+        | str TMP2, [TMP1]
+        break;
+    }
+    case MVM_OP_sp_deref_get_i64:
+    case MVM_OP_sp_deref_get_n: {
+        MVMint16 dst    = ins->operands[0].reg.orig;
+        MVMint16 obj    = ins->operands[1].reg.orig;
+        MVMint16 offset = ins->operands[2].lit_i16;
+        MVMint32 dst_off = WORK_OFF(dst);
+        MVMint32 obj_off = WORK_OFF(obj);
+        | ldr TMP1, [x21, #obj_off]
+        | ldr TMP3, [TMP1, #offset]
+        | ldr TMP2, [TMP3]
+        | str TMP2, [x21, #dst_off]
+        break;
+    }
+    case MVM_OP_sp_p6obind_i:
+    case MVM_OP_sp_p6obind_u:
+    case MVM_OP_sp_p6obind_i32:
+    case MVM_OP_sp_p6obind_u32:
+    case MVM_OP_sp_p6obind_n:
+    case MVM_OP_sp_p6obind_s:
+    case MVM_OP_sp_p6obind_o: {
+        MVMint16 obj    = ins->operands[0].reg.orig;
+        MVMint16 offset = ins->operands[1].lit_i16;
+        MVMint16 val    = ins->operands[2].reg.orig;
+        MVMint32 obj_off = WORK_OFF(obj);
+        MVMint32 val_off = WORK_OFF(val);
+        | ldr TMP1, [x21, #obj_off]
+        | ldr TMP2, [x21, #val_off]
+        /* compute body address, handling replaced */
+        | add TMP3, TMP1, #offsetof(MVMP6opaque, body)
+        | ldr TMP4, P6OBODY:TMP3->replaced
+        | cbz TMP4, >1
+        | mov TMP3, TMP4
+        |1:
+        if (op == MVM_OP_sp_p6obind_o || op == MVM_OP_sp_p6obind_s) {
+            | check_wb TMP1, TMP2, >2
+            /* spill TMP2 and TMP3 around write barrier */
+            | stp TMP2, TMP3, [sp, #48]
+            | mov ARG1, x19
+            | ldr ARG2, [x21, #obj_off]
+            | ldr ARG3, [x21, #val_off]
+            | callp &MVM_gc_write_barrier_hit_by
+            | ldp TMP2, TMP3, [sp, #48]
+            |2:
+        }
+        if (op == MVM_OP_sp_p6obind_i32 || op == MVM_OP_sp_p6obind_u32) {
+            | str w10, [TMP3, #offset]
+        } else {
+            | str TMP2, [TMP3, #offset]
+        }
+        break;
+    }
+    case MVM_OP_getwhere:
+    case MVM_OP_set: {
+        MVMint32 reg1 = ins->operands[0].reg.orig;
+        MVMint32 reg2 = ins->operands[1].reg.orig;
+        MVMint32 dst_off = WORK_OFF(reg1);
+        MVMint32 src_off = WORK_OFF(reg2);
+        | ldr TMP1, [x21, #src_off]
+        | str TMP1, [x21, #dst_off]
+        break;
+    }
+    case MVM_OP_sp_getspeshslot: {
+        MVMint16 dst = ins->operands[0].reg.orig;
+        MVMint16 spesh_idx = ins->operands[1].lit_i16;
+        MVMint32 dst_off = WORK_OFF(dst);
+        | get_spesh_slot TMP1, spesh_idx
+        | str TMP1, [x21, #dst_off]
+        break;
+    }
+    case MVM_OP_ctx: {
+        MVMint16 dst = ins->operands[0].reg.orig;
+        MVMint32 dst_off = WORK_OFF(dst);
+        | mov ARG1, x19
+        | ldr ARG2, TC->cur_frame
+        | callp &MVM_context_from_frame
+        | str RV, [x21, #dst_off]
+        break;
+    }
+    case MVM_OP_ctxlexpad: {
+        MVMint16 src = ins->operands[1].reg.orig;
+        MVMint16 dst = ins->operands[0].reg.orig;
+        MVMint32 src_off = WORK_OFF(src);
+        MVMint32 dst_off = WORK_OFF(dst);
+        | ldr TMP1, [x21, #src_off]
+        | test_type_object TMP1
+        | bne >1
+        | cmp_repr_id TMP1, TMP2, MVM_REPR_ID_MVMContext
+        | beq >2
+        |1:
+        | throw_adhoc "ctxlexpad needs an MVMContext"
+        |2:
+        | str TMP1, [x21, #dst_off]
+        break;
+    }
+    case MVM_OP_ctxcallerskipthunks: {
+        MVMint16 dst = ins->operands[0].reg.orig;
+        MVMint16 ctx = ins->operands[1].reg.orig;
+        MVMint32 dst_off = WORK_OFF(dst);
+        MVMint32 ctx_off = WORK_OFF(ctx);
+        | mov RV, xzr
+        | ldr TMP5, [x21, #ctx_off]
+        | test_type_object TMP5
+        | bne >1
+        | cmp_repr_id TMP5, TMP6, MVM_REPR_ID_MVMContext
+        | bne >1
+        | mov ARG1, x19
+        | mov ARG2, TMP5
+        | mov ARG3, #MVM_CTX_TRAV_CALLER_SKIP_THUNKS
+        | callp &MVM_context_apply_traversal
+        | str RV, [x21, #dst_off]
+        | b >2
+        |1:
+        | throw_adhoc "ctxcallerskipthunks needs an MVMContext"
+        |2:
+        break;
+    }
+    case MVM_OP_curcode: {
+        MVMint16 dst = ins->operands[0].reg.orig;
+        MVMint32 dst_off = WORK_OFF(dst);
+        | ldr TMP1, TC->cur_frame
+        | ldr TMP1, FRAME:TMP1->code_ref
+        | str TMP1, [x21, #dst_off]
+        break;
+    }
+    case MVM_OP_getcode: {
+        MVMint16 dst = ins->operands[0].reg.orig;
+        MVMuint16 idx = ins->operands[1].coderef_idx;
+        MVMint32 dst_off = WORK_OFF(dst);
+        MVMint32 idx_off = (MVMint32)(idx * sizeof(MVMObject*));
+        | ldr TMP1, CU->body.coderefs
+        | ldr TMP1, [TMP1, #idx_off]
+        | str TMP1, [x21, #dst_off]
+        break;
+    }
+    case MVM_OP_hllboxtype_n:
+    case MVM_OP_hllboxtype_s:
+    case MVM_OP_hllboxtype_i: {
+        MVMint16 dst = ins->operands[0].reg.orig;
+        MVMint32 dst_off = WORK_OFF(dst);
+        | ldr TMP1, CU->body.hll_config
+        if (op == MVM_OP_hllboxtype_n) {
+            | ldr TMP1, HLLCONFIG:TMP1->num_box_type
+        } else if (op == MVM_OP_hllboxtype_s) {
+            | ldr TMP1, HLLCONFIG:TMP1->str_box_type
+        } else {
+            | ldr TMP1, HLLCONFIG:TMP1->int_box_type
+        }
+        | str TMP1, [x21, #dst_off]
+        break;
+    }
+    case MVM_OP_null_s: {
+        MVMint16 dst = ins->operands[0].reg.orig;
+        MVMint32 dst_off = WORK_OFF(dst);
+        | str xzr, [x21, #dst_off]
+        break;
+    }
+    case MVM_OP_isnull_s: {
+        MVMint16 dst = ins->operands[0].reg.orig;
+        MVMint16 src = ins->operands[1].reg.orig;
+        MVMint32 dst_off = WORK_OFF(dst);
+        MVMint32 src_off = WORK_OFF(src);
+        | ldr TMP1, [x21, #src_off]
+        | cmp TMP1, #0
+        | cset TMP2, eq
+        | str TMP2, [x21, #dst_off]
+        break;
+    }
+    case MVM_OP_add_i:
+    case MVM_OP_sub_i:
+    case MVM_OP_bor_i:
+    case MVM_OP_band_i:
+    case MVM_OP_bxor_i: {
+        MVMint32 reg_a = ins->operands[0].reg.orig;
+        MVMint32 reg_b = ins->operands[1].reg.orig;
+        MVMint32 reg_c = ins->operands[2].reg.orig;
+        MVMint32 dst_off = WORK_OFF(reg_a);
+        MVMint32 src_b = WORK_OFF(reg_b);
+        MVMint32 src_c = WORK_OFF(reg_c);
+        | ldr TMP1, [x21, #src_b]
+        | ldr TMP2, [x21, #src_c]
+        switch (op) {
+        case MVM_OP_add_i:
+            | add TMP1, TMP1, TMP2
+            break;
+        case MVM_OP_sub_i:
+            | sub TMP1, TMP1, TMP2
+            break;
+        case MVM_OP_bor_i:
+            | orr TMP1, TMP1, TMP2
+            break;
+        case MVM_OP_band_i:
+            | and TMP1, TMP1, TMP2
+            break;
+        case MVM_OP_bxor_i:
+            | eor TMP1, TMP1, TMP2
+            break;
+        }
+        | str TMP1, [x21, #dst_off]
+        break;
+    }
+    case MVM_OP_mul_i:
+    case MVM_OP_blshift_i:
+    case MVM_OP_brshift_i: {
+        MVMint32 reg_a = ins->operands[0].reg.orig;
+        MVMint32 reg_b = ins->operands[1].reg.orig;
+        MVMint32 reg_c = ins->operands[2].reg.orig;
+        MVMint32 dst_off = WORK_OFF(reg_a);
+        MVMint32 src_b = WORK_OFF(reg_b);
+        MVMint32 src_c = WORK_OFF(reg_c);
+        | ldr TMP1, [x21, #src_b]
+        | ldr TMP2, [x21, #src_c]
+        switch (op) {
+        case MVM_OP_mul_i:
+            | mul TMP1, TMP1, TMP2
+            break;
+        case MVM_OP_blshift_i:
+            | lsl TMP1, TMP1, TMP2
+            break;
+        case MVM_OP_brshift_i:
+            | asr TMP1, TMP1, TMP2
+            break;
+        }
+        | str TMP1, [x21, #dst_off]
+        break;
+    }
+    case MVM_OP_pow_i: {
+        MVMint16 dst  = ins->operands[0].reg.orig;
+        MVMint16 base = ins->operands[1].reg.orig;
+        MVMint16 exp  = ins->operands[2].reg.orig;
+        MVMint32 dst_off  = WORK_OFF(dst);
+        MVMint32 base_off = WORK_OFF(base);
+        MVMint32 exp_off  = WORK_OFF(exp);
+        | ldr TMP2, [x21, #exp_off]
+        | cmp TMP2, #0
+        | blt >3
+        | mov TMP1, #1
+        | ldr TMP3, [x21, #base_off]
+        |1:
+        | tbz TMP2, #0, >2
+        | mul TMP1, TMP1, TMP3
+        |2:
+        | mul TMP3, TMP3, TMP3
+        | lsr TMP2, TMP2, #1
+        | cbnz TMP2, <1
+        |3:
+        | str TMP1, [x21, #dst_off]
+        break;
+    }
+    case MVM_OP_div_i: {
+        MVMint16 dst = ins->operands[0].reg.orig;
+        MVMint16 a   = ins->operands[1].reg.orig;
+        MVMint16 b   = ins->operands[2].reg.orig;
+        MVMint32 dst_off = WORK_OFF(dst);
+        MVMint32 a_off   = WORK_OFF(a);
+        MVMint32 b_off   = WORK_OFF(b);
+        | ldr TMP1, [x21, #a_off]
+        | ldr TMP2, [x21, #b_off]
+        | cbnz TMP2, >1
+        | throw_adhoc "Division by zero"
+        |1:
+        | sdiv TMP3, TMP1, TMP2
+        /* floor division: adjust if remainder != 0 and signs differ */
+        | msub TMP4, TMP3, TMP2, TMP1
+        | cbz TMP4, >2
+        | eor TMP4, TMP1, TMP2
+        | tbz TMP4, #63, >2
+        | sub TMP3, TMP3, #1
+        |2:
+        | str TMP3, [x21, #dst_off]
+        break;
+    }
+    case MVM_OP_mod_i: {
+        MVMint16 dst = ins->operands[0].reg.orig;
+        MVMint16 a   = ins->operands[1].reg.orig;
+        MVMint16 b   = ins->operands[2].reg.orig;
+        MVMint32 dst_off = WORK_OFF(dst);
+        MVMint32 a_off   = WORK_OFF(a);
+        MVMint32 b_off   = WORK_OFF(b);
+        | ldr TMP1, [x21, #a_off]
+        | ldr TMP2, [x21, #b_off]
+        | cbnz TMP2, >1
+        | throw_adhoc "Division by zero"
+        |1:
+        | sdiv TMP3, TMP1, TMP2
+        | msub TMP3, TMP3, TMP2, TMP1
+        | str TMP3, [x21, #dst_off]
+        break;
+    }
+    case MVM_OP_inc_u:
+    case MVM_OP_inc_i: {
+        MVMint32 reg = ins->operands[0].reg.orig;
+        MVMint32 off = WORK_OFF(reg);
+        | ldr TMP1, [x21, #off]
+        | add TMP1, TMP1, #1
+        | str TMP1, [x21, #off]
+        break;
+    }
+    case MVM_OP_dec_u:
+    case MVM_OP_dec_i: {
+        MVMint32 reg = ins->operands[0].reg.orig;
+        MVMint32 off = WORK_OFF(reg);
+        | ldr TMP1, [x21, #off]
+        | sub TMP1, TMP1, #1
+        | str TMP1, [x21, #off]
+        break;
+    }
+    case MVM_OP_bnot_i: {
+        MVMint16 dst = ins->operands[0].reg.orig;
+        MVMint16 src = ins->operands[1].reg.orig;
+        MVMint32 dst_off = WORK_OFF(dst);
+        MVMint32 src_off = WORK_OFF(src);
+        | ldr TMP1, [x21, #src_off]
+        | mvn TMP1, TMP1
+        | str TMP1, [x21, #dst_off]
+        break;
+    }
+    case MVM_OP_neg_i: {
+        MVMint16 dst = ins->operands[0].reg.orig;
+        MVMint16 src = ins->operands[1].reg.orig;
+        MVMint32 dst_off = WORK_OFF(dst);
+        MVMint32 src_off = WORK_OFF(src);
+        | ldr TMP1, [x21, #src_off]
+        | neg TMP1, TMP1
+        | str TMP1, [x21, #dst_off]
+        break;
+    }
+    case MVM_OP_abs_i: {
+        MVMint16 dst = ins->operands[0].reg.orig;
+        MVMint16 src = ins->operands[1].reg.orig;
+        MVMint32 dst_off = WORK_OFF(dst);
+        MVMint32 src_off = WORK_OFF(src);
+        | ldr TMP1, [x21, #src_off]
+        | cmp TMP1, #0
+        | cneg TMP1, TMP1, mi
+        | str TMP1, [x21, #dst_off]
+        break;
+    }
+    case MVM_OP_extend_i8: {
+        MVMint16 dst = ins->operands[0].reg.orig;
+        MVMint16 src = ins->operands[1].reg.orig;
+        MVMint32 dst_off = WORK_OFF(dst);
+        MVMint32 src_off = WORK_OFF(src);
+        | ldr TMP1, [x21, #src_off]
+        | sxtb TMP1, TMP1
+        | str TMP1, [x21, #dst_off]
+        break;
+    }
+    case MVM_OP_extend_u8: {
+        MVMint16 dst = ins->operands[0].reg.orig;
+        MVMint16 src = ins->operands[1].reg.orig;
+        MVMint32 dst_off = WORK_OFF(dst);
+        MVMint32 src_off = WORK_OFF(src);
+        | ldr TMP1, [x21, #src_off]
+        | uxtb w9, w9
+        | str TMP1, [x21, #dst_off]
+        break;
+    }
+    case MVM_OP_extend_i16: {
+        MVMint16 dst = ins->operands[0].reg.orig;
+        MVMint16 src = ins->operands[1].reg.orig;
+        MVMint32 dst_off = WORK_OFF(dst);
+        MVMint32 src_off = WORK_OFF(src);
+        | ldr TMP1, [x21, #src_off]
+        | sxth TMP1, TMP1
+        | str TMP1, [x21, #dst_off]
+        break;
+    }
+    case MVM_OP_extend_u16: {
+        MVMint16 dst = ins->operands[0].reg.orig;
+        MVMint16 src = ins->operands[1].reg.orig;
+        MVMint32 dst_off = WORK_OFF(dst);
+        MVMint32 src_off = WORK_OFF(src);
+        | ldr TMP1, [x21, #src_off]
+        | uxth w9, w9
+        | str TMP1, [x21, #dst_off]
+        break;
+    }
+    case MVM_OP_extend_i32: {
+        MVMint16 dst = ins->operands[0].reg.orig;
+        MVMint16 src = ins->operands[1].reg.orig;
+        MVMint32 dst_off = WORK_OFF(dst);
+        MVMint32 src_off = WORK_OFF(src);
+        | ldr TMP1, [x21, #src_off]
+        | sxtw TMP1, w9
+        | str TMP1, [x21, #dst_off]
+        break;
+    }
+    case MVM_OP_extend_u32: {
+        MVMint16 dst = ins->operands[0].reg.orig;
+        MVMint16 src = ins->operands[1].reg.orig;
+        MVMint32 dst_off = WORK_OFF(dst);
+        MVMint32 src_off = WORK_OFF(src);
+        | ldr TMP1, [x21, #src_off]
+        | mov w9, w9
+        | str TMP1, [x21, #dst_off]
+        break;
+    }
+    case MVM_OP_trunc_u8:
+    case MVM_OP_trunc_i8: {
+        MVMint16 dst = ins->operands[0].reg.orig;
+        MVMint16 src = ins->operands[1].reg.orig;
+        MVMint32 dst_off = WORK_OFF(dst);
+        MVMint32 src_off = WORK_OFF(src);
+        | ldr TMP1, [x21, #src_off]
+        | uxtb w9, w9
+        | str TMP1, [x21, #dst_off]
+        break;
+    }
+    case MVM_OP_trunc_u16:
+    case MVM_OP_trunc_i16: {
+        MVMint16 dst = ins->operands[0].reg.orig;
+        MVMint16 src = ins->operands[1].reg.orig;
+        MVMint32 dst_off = WORK_OFF(dst);
+        MVMint32 src_off = WORK_OFF(src);
+        | ldr TMP1, [x21, #src_off]
+        | uxth w9, w9
+        | str TMP1, [x21, #dst_off]
+        break;
+    }
+    case MVM_OP_trunc_u32:
+    case MVM_OP_trunc_i32: {
+        MVMint16 dst = ins->operands[0].reg.orig;
+        MVMint16 src = ins->operands[1].reg.orig;
+        MVMint32 dst_off = WORK_OFF(dst);
+        MVMint32 src_off = WORK_OFF(src);
+        | ldr TMP1, [x21, #src_off]
+        | mov w9, w9
+        | str TMP1, [x21, #dst_off]
+        break;
+    }
+    case MVM_OP_sp_istrue_n: {
+        MVMint16 dst = ins->operands[0].reg.orig;
+        MVMint16 src = ins->operands[1].reg.orig;
+        MVMint32 dst_off = WORK_OFF(dst);
+        MVMint32 src_off = WORK_OFF(src);
+        | ldr d0, [x21, #src_off]
+        | fcmp d0, #0.0
+        | cset TMP1, ne
+        | cset TMP2, vs
+        | orr TMP1, TMP1, TMP2
+        | str TMP1, [x21, #dst_off]
+        break;
+    }
+    case MVM_OP_add_n:
+    case MVM_OP_sub_n:
+    case MVM_OP_mul_n:
+    case MVM_OP_div_n: {
+        MVMint16 reg_a = ins->operands[0].reg.orig;
+        MVMint16 reg_b = ins->operands[1].reg.orig;
+        MVMint16 reg_c = ins->operands[2].reg.orig;
+        MVMint32 a_off = WORK_OFF(reg_a);
+        MVMint32 b_off = WORK_OFF(reg_b);
+        MVMint32 c_off = WORK_OFF(reg_c);
+        | ldr d0, [x21, #b_off]
+        | ldr d1, [x21, #c_off]
+        switch (op) {
+        case MVM_OP_add_n:
+            | fadd d0, d0, d1
+            break;
+        case MVM_OP_sub_n:
+            | fsub d0, d0, d1
+            break;
+        case MVM_OP_mul_n:
+            | fmul d0, d0, d1
+            break;
+        case MVM_OP_div_n:
+            | fdiv d0, d0, d1
+            break;
+        }
+        | str d0, [x21, #a_off]
+        break;
+    }
+    case MVM_OP_coerce_iu:
+    case MVM_OP_coerce_ui: {
+        MVMint16 dst = ins->operands[0].reg.orig;
+        MVMint16 src = ins->operands[1].reg.orig;
+        MVMint32 dst_off = WORK_OFF(dst);
+        MVMint32 src_off = WORK_OFF(src);
+        | ldr TMP1, [x21, #src_off]
+        | str TMP1, [x21, #dst_off]
+        break;
+    }
+    case MVM_OP_coerce_un: {
+        MVMint16 dst = ins->operands[0].reg.orig;
+        MVMint16 src = ins->operands[1].reg.orig;
+        MVMint32 dst_off = WORK_OFF(dst);
+        MVMint32 src_off = WORK_OFF(src);
+        | ldr TMP1, [x21, #src_off]
+        | ucvtf d0, TMP1
+        | str d0, [x21, #dst_off]
+        break;
+    }
+    case MVM_OP_coerce_in: {
+        MVMint16 dst = ins->operands[0].reg.orig;
+        MVMint16 src = ins->operands[1].reg.orig;
+        MVMint32 dst_off = WORK_OFF(dst);
+        MVMint32 src_off = WORK_OFF(src);
+        | ldr TMP1, [x21, #src_off]
+        | scvtf d0, TMP1
+        | str d0, [x21, #dst_off]
+        break;
+    }
+    case MVM_OP_coerce_ni: {
+        MVMint16 dst = ins->operands[0].reg.orig;
+        MVMint16 src = ins->operands[1].reg.orig;
+        MVMint32 dst_off = WORK_OFF(dst);
+        MVMint32 src_off = WORK_OFF(src);
+        | ldr d0, [x21, #src_off]
+        | fcvtzs TMP1, d0
+        | str TMP1, [x21, #dst_off]
+        break;
+    }
+    case MVM_OP_neg_n: {
+        MVMint16 dst = ins->operands[0].reg.orig;
+        MVMint16 src = ins->operands[1].reg.orig;
+        MVMint32 dst_off = WORK_OFF(dst);
+        MVMint32 src_off = WORK_OFF(src);
+        | ldr d0, [x21, #src_off]
+        | fneg d0, d0
+        | str d0, [x21, #dst_off]
+        break;
+    }
+    case MVM_OP_eq_u:
+    case MVM_OP_eq_i:
+    case MVM_OP_eqaddr:
+    case MVM_OP_ne_u:
+    case MVM_OP_ne_i:
+    case MVM_OP_lt_u:
+    case MVM_OP_lt_i:
+    case MVM_OP_le_u:
+    case MVM_OP_le_i:
+    case MVM_OP_gt_u:
+    case MVM_OP_gt_i:
+    case MVM_OP_ge_u:
+    case MVM_OP_ge_i: {
+        MVMint32 reg_a = ins->operands[0].reg.orig;
+        MVMint32 reg_b = ins->operands[1].reg.orig;
+        MVMint32 reg_c = ins->operands[2].reg.orig;
+        MVMint32 a_off = WORK_OFF(reg_a);
+        MVMint32 b_off = WORK_OFF(reg_b);
+        MVMint32 c_off = WORK_OFF(reg_c);
+        | ldr TMP1, [x21, #b_off]
+        | ldr TMP2, [x21, #c_off]
+        | cmp TMP1, TMP2
+        switch (op) {
+        case MVM_OP_eq_i: case MVM_OP_eq_u: case MVM_OP_eqaddr:
+            | cset TMP3, eq
+            break;
+        case MVM_OP_ne_i: case MVM_OP_ne_u:
+            | cset TMP3, ne
+            break;
+        case MVM_OP_lt_i:
+            | cset TMP3, lt
+            break;
+        case MVM_OP_le_i:
+            | cset TMP3, le
+            break;
+        case MVM_OP_gt_i:
+            | cset TMP3, gt
+            break;
+        case MVM_OP_ge_i:
+            | cset TMP3, ge
+            break;
+        case MVM_OP_lt_u:
+            | cset TMP3, lo
+            break;
+        case MVM_OP_le_u:
+            | cset TMP3, ls
+            break;
+        case MVM_OP_gt_u:
+            | cset TMP3, hi
+            break;
+        case MVM_OP_ge_u:
+            | cset TMP3, hs
+            break;
+        default:
+            | cset TMP3, eq
+            break;
+        }
+        | str TMP3, [x21, #a_off]
+        break;
+    }
+    case MVM_OP_cmp_u:
+    case MVM_OP_cmp_i: {
+        MVMint32 reg_a = ins->operands[0].reg.orig;
+        MVMint32 reg_b = ins->operands[1].reg.orig;
+        MVMint32 reg_c = ins->operands[2].reg.orig;
+        MVMint32 a_off = WORK_OFF(reg_a);
+        MVMint32 b_off = WORK_OFF(reg_b);
+        MVMint32 c_off = WORK_OFF(reg_c);
+        | ldr TMP1, [x21, #b_off]
+        | ldr TMP2, [x21, #c_off]
+        if (op == MVM_OP_cmp_i) {
+            | cmp TMP1, TMP2
+            | cset TMP3, gt
+            | cset TMP4, lt
+        } else {
+            | cmp TMP1, TMP2
+            | cset TMP3, hi
+            | cset TMP4, lo
+        }
+        | sub TMP3, TMP3, TMP4
+        | str TMP3, [x21, #a_off]
+        break;
+    }
+    case MVM_OP_gt_s:
+    case MVM_OP_ge_s:
+    case MVM_OP_lt_s:
+    case MVM_OP_le_s: {
+        MVMint32 reg = ins->operands[0].reg.orig;
+        MVMint32 off = WORK_OFF(reg);
+        | ldr TMP2, [x21, #off]
+        switch (op) {
+        case MVM_OP_gt_s:
+            | cmp TMP2, #1
+            | cset TMP1, eq
+            break;
+        case MVM_OP_lt_s:
+            | cmn TMP2, #1
+            | cset TMP1, eq
+            break;
+        case MVM_OP_ge_s:
+            | cmp TMP2, #0
+            | cset TMP1, ge
+            break;
+        case MVM_OP_le_s:
+            | cmp TMP2, #0
+            | cset TMP1, le
+            break;
+        }
+        | str TMP1, [x21, #off]
+        break;
+    }
+    case MVM_OP_not_i: {
+        MVMint16 dst = ins->operands[0].reg.orig;
+        MVMint16 src = ins->operands[1].reg.orig;
+        MVMint32 dst_off = WORK_OFF(dst);
+        MVMint32 src_off = WORK_OFF(src);
+        | ldr TMP1, [x21, #src_off]
+        | cmp TMP1, #0
+        | cset TMP2, eq
+        | str TMP2, [x21, #dst_off]
+        break;
+    }
+    case MVM_OP_eq_n:
+    case MVM_OP_ne_n:
+    case MVM_OP_le_n:
+    case MVM_OP_lt_n:
+    case MVM_OP_ge_n:
+    case MVM_OP_gt_n: {
+        MVMint16 dst = ins->operands[0].reg.orig;
+        MVMint16 a   = ins->operands[1].reg.orig;
+        MVMint16 b   = ins->operands[2].reg.orig;
+        MVMint32 dst_off = WORK_OFF(dst);
+        MVMint32 a_off = WORK_OFF(a);
+        MVMint32 b_off = WORK_OFF(b);
+        | ldr d0, [x21, #a_off]
+        | ldr d1, [x21, #b_off]
+        switch (op) {
+        case MVM_OP_eq_n:
+            | fcmp d0, d1
+            | cset TMP1, eq
+            break;
+        case MVM_OP_ne_n:
+            | fcmp d0, d1
+            | cset TMP1, ne
+            break;
+        case MVM_OP_lt_n:
+            | fcmp d0, d1
+            | cset TMP1, mi
+            break;
+        case MVM_OP_le_n:
+            /* reversed: fcmp d1,d0 then GE */
+            | fcmp d1, d0
+            | cset TMP1, ge
+            break;
+        case MVM_OP_ge_n:
+            | fcmp d0, d1
+            | cset TMP1, ge
+            break;
+        case MVM_OP_gt_n:
+            | fcmp d0, d1
+            | cset TMP1, gt
+            break;
+        }
+        | str TMP1, [x21, #dst_off]
+        break;
+    }
+    case MVM_OP_cmp_n: {
+        MVMint16 dst = ins->operands[0].reg.orig;
+        MVMint16 a   = ins->operands[1].reg.orig;
+        MVMint16 b   = ins->operands[2].reg.orig;
+        MVMint32 dst_off = WORK_OFF(dst);
+        MVMint32 a_off = WORK_OFF(a);
+        MVMint32 b_off = WORK_OFF(b);
+        | ldr d0, [x21, #a_off]
+        | ldr d1, [x21, #b_off]
+        | fcmp d0, d1
+        | cset TMP1, gt
+        | cset TMP2, mi
+        | sub TMP1, TMP1, TMP2
+        | str TMP1, [x21, #dst_off]
+        break;
+    }
+    case MVM_OP_eq_I:
+    case MVM_OP_ne_I:
+    case MVM_OP_lt_I:
+    case MVM_OP_le_I:
+    case MVM_OP_gt_I:
+    case MVM_OP_ge_I: {
+        MVMint32 reg_a = ins->operands[0].reg.orig;
+        MVMint32 reg_b = ins->operands[1].reg.orig;
+        MVMint32 reg_c = ins->operands[2].reg.orig;
+        MVMint32 a_off = WORK_OFF(reg_a);
+        MVMint32 b_off = WORK_OFF(reg_b);
+        MVMint32 c_off = WORK_OFF(reg_c);
+        | mov ARG1, x19
+        | ldr ARG2, [x21, #b_off]
+        | ldr ARG3, [x21, #c_off]
+        | callp &MVM_bigint_cmp
+        switch (op) {
+        case MVM_OP_eq_I:
+            | cmp RV, #MP_EQ
+            | cset RV, eq
+            break;
+        case MVM_OP_ne_I:
+            | cmp RV, #MP_EQ
+            | cset RV, ne
+            break;
+        case MVM_OP_lt_I:
+            | cmp RV, #MP_LT
+            | cset RV, eq
+            break;
+        case MVM_OP_le_I:
+            | cmp RV, #MP_GT
+            | cset RV, ne
+            break;
+        case MVM_OP_gt_I:
+            | cmp RV, #MP_GT
+            | cset RV, eq
+            break;
+        case MVM_OP_ge_I:
+            | cmp RV, #MP_LT
+            | cset RV, ne
+            break;
+        }
+        | str RV, [x21, #a_off]
+        break;
+    }
+    case MVM_OP_iscoderef:
+    case MVM_OP_isint:
+    case MVM_OP_isnum:
+    case MVM_OP_isstr:
+    case MVM_OP_islist:
+    case MVM_OP_ishash: {
+        MVMint16 dst = ins->operands[0].reg.orig;
+        MVMint16 obj = ins->operands[1].reg.orig;
+        MVMint32 reprid = op == MVM_OP_isint    ? MVM_REPR_ID_P6int   :
+                          op == MVM_OP_isnum    ? MVM_REPR_ID_P6num   :
+                          op == MVM_OP_isstr    ? MVM_REPR_ID_P6str   :
+                          op == MVM_OP_islist   ? MVM_REPR_ID_VMArray :
+                          op == MVM_OP_ishash   ? MVM_REPR_ID_MVMHash :
+                       /* iscoderef: */ MVM_REPR_ID_MVMCode;
+        MVMint32 dst_off = WORK_OFF(dst);
+        MVMint32 obj_off = WORK_OFF(obj);
+        | ldr TMP1, [x21, #obj_off]
+        | cbz TMP1, >1
+        | ldr TMP2, OBJECT:TMP1->st
+        | ldr TMP2, STABLE:TMP2->REPR
+        | ldr w17, REPR:TMP2->ID
+        | cmp w17, #reprid
+        | bne >1
+        if (op == MVM_OP_iscoderef) {
+            | test_type_object TMP1
+            | bne >1
+        }
+        | mov TMP2, #1
+        | str TMP2, [x21, #dst_off]
+        | b >2
+        |1:
+        | str xzr, [x21, #dst_off]
+        |2:
+        break;
+    }
+    case MVM_OP_objprimspec: {
+        MVMint16 dst  = ins->operands[0].reg.orig;
+        MVMint16 type = ins->operands[1].reg.orig;
+        MVMint32 dst_off  = WORK_OFF(dst);
+        MVMint32 type_off = WORK_OFF(type);
+        | ldr TMP6, [x21, #type_off]
+        | cbz TMP6, >1
+        | mov ARG1, x19
+        | ldr ARG2, OBJECT:TMP6->st
+        | ldr FUNCTION, STABLE:ARG2->REPR
+        | ldr FUNCTION, REPR:FUNCTION->get_storage_spec
+        | blr FUNCTION
+        | ldrh w14, STORAGESPEC:RV->boxed_primitive
+        |1:
+        | str TMP6, [x21, #dst_off]
+        break;
+    }
+    case MVM_OP_objprimbits: {
+        MVMint16 dst  = ins->operands[0].reg.orig;
+        MVMint16 type = ins->operands[1].reg.orig;
+        MVMint32 dst_off  = WORK_OFF(dst);
+        MVMint32 type_off = WORK_OFF(type);
+        | ldr TMP6, [x21, #type_off]
+        | cbz TMP6, >1
+        | ldr ARG2, OBJECT:TMP6->st
+        | ldr FUNCTION, STABLE:ARG2->REPR
+        | ldr FUNCTION, REPR:FUNCTION->get_storage_spec
+        | mov ARG1, x19
+        | blr FUNCTION
+        | ldrh w14, STORAGESPEC:RV->boxed_primitive
+        | cbz TMP6, >1
+        | ldrh w14, STORAGESPEC:RV->bits
+        |1:
+        | str TMP6, [x21, #dst_off]
+        break;
+    }
+    case MVM_OP_objprimunsigned: {
+        MVMint16 dst  = ins->operands[0].reg.orig;
+        MVMint16 type = ins->operands[1].reg.orig;
+        MVMint32 dst_off  = WORK_OFF(dst);
+        MVMint32 type_off = WORK_OFF(type);
+        | ldr TMP5, [x21, #type_off]
+        | cbz TMP5, >1
+        | mov ARG1, x19
+        | ldr ARG2, OBJECT:TMP5->st
+        | ldr FUNCTION, STABLE:ARG2->REPR
+        | ldr FUNCTION, REPR:FUNCTION->get_storage_spec
+        | blr FUNCTION
+        | ldrh w14, STORAGESPEC:RV->boxed_primitive
+        | cbz TMP6, >1
+        | ldrb w14, STORAGESPEC:RV->is_unsigned
+        | str TMP6, [x21, #dst_off]
+        | b >2
+        |1:
+        | str xzr, [x21, #dst_off]
+        |2:
+        break;
+    }
+    case MVM_OP_isnonnull: {
+        MVMint16 dst = ins->operands[0].reg.orig;
+        MVMint16 obj = ins->operands[1].reg.orig;
+        MVMint32 dst_off = WORK_OFF(dst);
+        MVMint32 obj_off = WORK_OFF(obj);
+        | ldr TMP1, [x21, #obj_off]
+        | cmp TMP1, #0
+        | cset TMP2, ne
+        | get_vmnull TMP3
+        | cmp TMP1, TMP3
+        | cset TMP3, ne
+        | and TMP2, TMP2, TMP3
+        | str TMP2, [x21, #dst_off]
+        break;
+    }
+    case MVM_OP_isnull: {
+        MVMint16 dst = ins->operands[0].reg.orig;
+        MVMint16 obj = ins->operands[1].reg.orig;
+        MVMint32 dst_off = WORK_OFF(dst);
+        MVMint32 obj_off = WORK_OFF(obj);
+        | ldr TMP1, [x21, #obj_off]
+        | cmp TMP1, #0
+        | cset TMP2, eq
+        | get_vmnull TMP3
+        | cmp TMP1, TMP3
+        | cset TMP3, eq
+        | orr TMP2, TMP2, TMP3
+        | str TMP2, [x21, #dst_off]
+        break;
+    }
+    case MVM_OP_sp_fastcreate: {
+        MVMint16 dst = ins->operands[0].reg.orig;
+        MVMint32 dst_off = WORK_OFF(dst);
+        arm64_emit_fastcreate(tc, compiler, jg, ins);
+        | str RV, [x21, #dst_off]
+        break;
+    }
+    case MVM_OP_decont:
+    case MVM_OP_sp_decont: {
+        MVMint16 dst = ins->operands[0].reg.orig;
+        MVMint16 src = ins->operands[1].reg.orig;
+        MVMint32 dst_off = WORK_OFF(dst);
+        MVMint32 src_off = WORK_OFF(src);
+        | ldr TMP5, [x21, #src_off]
+        | test_type_object TMP5
+        | bne >1
+        | ldr TMP6, OBJECT:TMP5->st
+        | ldr TMP6, STABLE:TMP6->container_spec
+        | cbz TMP6, >1
+        | mov ARG1, x19
+        | mov ARG2, TMP5
+        | add ARG3, x21, #dst_off
+        | ldr FUNCTION, CONTAINERSPEC:TMP6->fetch
+        | blr FUNCTION
+        | b >2
+        |1:
+        | str TMP5, [x21, #dst_off]
+        |2:
+        break;
+    }
+    case MVM_OP_iscont: {
+        MVMint16 dst = ins->operands[0].reg.orig;
+        MVMint16 obj = ins->operands[1].reg.orig;
+        MVMint32 dst_off = WORK_OFF(dst);
+        MVMint32 obj_off = WORK_OFF(obj);
+        | ldr TMP1, [x21, #obj_off]
+        | cbz TMP1, >1
+        | ldr TMP1, OBJECT:TMP1->st
+        | ldr TMP1, STABLE:TMP1->container_spec
+        |1:
+        | cset TMP1, ne
+        | str TMP1, [x21, #dst_off]
+        break;
+    }
+    case MVM_OP_isconcrete: {
+        MVMint16 dst = ins->operands[0].reg.orig;
+        MVMint16 obj = ins->operands[1].reg.orig;
+        MVMint32 dst_off = WORK_OFF(dst);
+        MVMint32 obj_off = WORK_OFF(obj);
+        | ldr TMP1, [x21, #obj_off]
+        | cbz TMP1, >1
+        | test_type_object TMP1
+        | bne >1
+        | mov TMP2, #1
+        | str TMP2, [x21, #dst_off]
+        | b >2
+        |1:
+        | str xzr, [x21, #dst_off]
+        |2:
+        break;
+    }
+    case MVM_OP_markcodestatic: {
+        MVMint16 cr = ins->operands[0].reg.orig;
+        MVMint32 cr_off = WORK_OFF(cr);
+        | ldr TMP1, [x21, #cr_off]
+        | test_type_object TMP1
+        | bne >1
+        | cmp_repr_id TMP1, TMP2, MVM_REPR_ID_MVMCode
+        | beq >2
+        |1:
+        | throw_adhoc "markcodestatic requires a concrete coderef"
+        |2:
+        | mov w10, #1
+        | str w10, CODE:TMP1->body.is_static
+        break;
+    }
+    case MVM_OP_markcodestub: {
+        MVMint16 cr = ins->operands[0].reg.orig;
+        MVMint32 cr_off = WORK_OFF(cr);
+        | ldr TMP1, [x21, #cr_off]
+        | test_type_object TMP1
+        | bne >1
+        | cmp_repr_id TMP1, TMP2, MVM_REPR_ID_MVMCode
+        | beq >2
+        |1:
+        | throw_adhoc "markcodestub requires a concrete coderef"
+        |2:
+        | mov w10, #1
+        | str w10, CODE:TMP1->body.is_compiler_stub
+        break;
+    }
+    case MVM_OP_takehandlerresult: {
+        MVMint16 dst = ins->operands[0].reg.orig;
+        MVMint32 dst_off = WORK_OFF(dst);
+        | ldr TMP1, TC->last_handler_result
+        | cbnz TMP1, >1
+        | get_vmnull TMP1
+        |1:
+        | str TMP1, [x21, #dst_off]
+        | str xzr, TC->last_handler_result
+        break;
+    }
+    case MVM_OP_exception: {
+        MVMint16 dst = ins->operands[0].reg.orig;
+        MVMint32 dst_off = WORK_OFF(dst);
+        | ldr TMP1, TC->active_handlers
+        | cbz TMP1, >1
+        | ldr TMP1, MVMACTIVEHANDLERS:TMP1->ex_obj
+        | str TMP1, [x21, #dst_off]
+        | b >2
+        |1:
+        | get_vmnull TMP1
+        | str TMP1, [x21, #dst_off]
+        |2:
+        break;
+    }
+    case MVM_OP_scwbdisable: {
+        MVMint16 dst = ins->operands[0].reg.orig;
+        MVMint32 dst_off = WORK_OFF(dst);
+        | ldr w9, TC->sc_wb_disable_depth
+        | add w9, w9, #1
+        | str w9, TC->sc_wb_disable_depth
+        | str TMP1, [x21, #dst_off]
+        break;
+    }
+    case MVM_OP_scwbenable: {
+        MVMint16 dst = ins->operands[0].reg.orig;
+        MVMint32 dst_off = WORK_OFF(dst);
+        | ldr w9, TC->sc_wb_disable_depth
+        | sub w9, w9, #1
+        | str w9, TC->sc_wb_disable_depth
+        | str TMP1, [x21, #dst_off]
+        break;
+    }
+    case MVM_OP_assign:
+    case MVM_OP_assignunchecked: {
+        MVMint16 cont = ins->operands[0].reg.orig;
+        MVMint16 obj  = ins->operands[1].reg.orig;
+        MVMint32 cont_off = WORK_OFF(cont);
+        MVMint32 obj_off  = WORK_OFF(obj);
+        | ldr ARG2, [x21, #cont_off]
+        | ldr FUNCTION, OBJECT:ARG2->st
+        | ldr FUNCTION, STABLE:FUNCTION->container_spec
+        | cbnz FUNCTION, >1
+        | throw_adhoc "Cannot assign to an immutable value"
+        |1:
+        | mov ARG1, x19
+        | ldr ARG3, [x21, #obj_off]
+        if (op == MVM_OP_assign) {
+            | ldr FUNCTION, CONTAINERSPEC:FUNCTION->store
+        } else {
+            | ldr FUNCTION, CONTAINERSPEC:FUNCTION->store_unchecked
+        }
+        | blr FUNCTION
+        break;
+    }
+    case MVM_OP_sp_getlexstatic_o: {
+        MVMint16 dst       = ins->operands[0].reg.orig;
+        MVMint16 name      = ins->operands[1].reg.orig;
+        MVMint16 spesh_idx = ins->operands[2].lit_i16;
+        MVMuint32 slot     = ins->operands[3].lit_ui32;
+        MVMint32 dst_off  = WORK_OFF(dst);
+        MVMint32 name_off = WORK_OFF(name);
+        MVMint32 ic_off   = (MVMint32)offsetof(MVMStaticFrame, body.inline_cache);
+        MVMint32 entry_off = (MVMint32)(slot * sizeof(MVMDispInlineCacheEntry));
+        | mov ARG1, x19
+        | get_spesh_slot ARG2, spesh_idx
+        | add ARG2, ARG2, #ic_off
+        | ldr ARG2, MVMDISPINLINECACHE:ARG2->entries
+        | add ARG2, ARG2, #entry_off
+        | ldr ARG3, [x21, #name_off]
+        | ldr FUNCTION, [ARG2]
+        | ldr FUNCTION, MVMDISPINLINECACHEENTRY:FUNCTION->run_getlexstatic
+        | blr FUNCTION
+        | str RV, [x21, #dst_off]
+        break;
+    }
+    case MVM_OP_getlexperinvtype_o: {
+        MVMint16 dst  = ins->operands[0].reg.orig;
+        MVMint16 name = ins->operands[1].reg.orig;
+        MVMint32 dst_off  = WORK_OFF(dst);
+        MVMint32 name_off = WORK_OFF(name);
+        | mov ARG1, x19
+        | ldr ARG2, [x21, #name_off]
+        | mov ARG3, #MVM_reg_obj
+        | callp &MVM_frame_find_lexical_by_name
+        | cbz RV, >1
+        | ldr RV, [RV]
+        |1:
+        | str RV, [x21, #dst_off]
+        break;
+    }
+    case MVM_OP_paramnamesused: {
+        MVMint32 params_off = (MVMint32)offsetof(MVMFrame, params);
+        | ldr TMP2, TC->cur_frame
+        | add ARG2, TMP2, #params_off
+        | ldr ARG3, ARGCTX:ARG2->arg_info.callsite
+        | ldrh w9, CALLSITE:ARG3->num_pos
+        | ldrh w10, CALLSITE:ARG3->flag_count
+        | cmp w9, w10
+        | beq >1
+        | mov ARG1, x19
+        | callp &MVM_args_assert_nameds_used
+        |1:
+        break;
+    }
+    case MVM_OP_sp_assertparamcheck: {
+        MVMint16 ok        = ins->operands[0].reg.orig;
+        MVMint16 spesh_idx = ins->operands[1].lit_i16;
+        MVMuint32 slot     = ins->operands[2].lit_ui32;
+        MVMint32 ok_off   = WORK_OFF(ok);
+        MVMint32 ic_off   = (MVMint32)offsetof(MVMStaticFrame, body.inline_cache);
+        MVMint32 entry_off = (MVMint32)(slot * sizeof(MVMDispInlineCacheEntry));
+        | ldr TMP1, [x21, #ok_off]
+        | cbnz TMP1, >1
+        | mov ARG1, x19
+        | get_spesh_slot ARG2, spesh_idx
+        | add ARG2, ARG2, #ic_off
+        | ldr ARG2, MVMDISPINLINECACHE:ARG2->entries
+        | add ARG2, ARG2, #entry_off
+        | callp &MVM_args_bind_failed
+        |1:
+        break;
+    }
+    case MVM_OP_prof_enterspesh:
+        | mov ARG1, x19
+        | ldr ARG2, TC->cur_frame
+        | ldr ARG2, FRAME:ARG2->static_info
+        | mov ARG3, #MVM_PROFILE_ENTER_JIT
+        | callp &MVM_profile_log_enter
+        break;
+    case MVM_OP_prof_enterinline: {
+        MVMint16 spesh_idx = ins->operands[0].lit_i16;
+        | mov ARG1, x19
+        | get_spesh_slot ARG2, spesh_idx
+        | mov ARG3, #MVM_PROFILE_ENTER_JIT_INLINE
+        | callp &MVM_profile_log_enter
+        break;
+    }
+    case MVM_OP_prof_replaced: {
+        MVMint16 spesh_idx = ins->operands[0].lit_i16;
+        | mov ARG1, x19
+        | get_spesh_slot ARG2, spesh_idx
+        | callp &MVM_profile_log_scalar_replaced
+        break;
+    }
+    case MVM_OP_getobjsc: {
+        MVMint16 dst = ins->operands[0].reg.orig;
+        MVMint16 obj = ins->operands[1].reg.orig;
+        MVMint32 dst_off = WORK_OFF(dst);
+        MVMint32 obj_off = WORK_OFF(obj);
+        | ldr TMP1, [x21, #obj_off]
+        | ldr w10, COLLECTABLE:TMP1->sc_forward_u.sc.sc_idx
+        | mov TMP3, xzr
+        | cmp w10, #0
+        | ble >1
+        | ldr TMP3, TC->instance
+        | ldr TMP3, MVMINSTANCE:TMP3->all_scs
+        | ldr TMP3, [TMP3, TMP2, lsl #3]
+        | ldr TMP3, SCREFBODY:TMP3->sc
+        |1:
+        | str TMP3, [x21, #dst_off]
+        break;
+    }
+    case MVM_OP_setobjsc: {
+        MVMint16 obj = ins->operands[0].reg.orig;
+        MVMint16 sc  = ins->operands[1].reg.orig;
+        MVMint32 obj_off = WORK_OFF(obj);
+        MVMint32 sc_off  = WORK_OFF(sc);
+        | ldr TMP5, [x21, #sc_off]
+        | cmp_repr_id TMP5, TMP6, MVM_REPR_ID_SCRef
+        | beq >1
+        | throw_adhoc "Must provide an SCRef operand to setobjsc"
+        |1:
+        | mov ARG1, x19
+        | ldr ARG2, [x21, #obj_off]
+        | mov ARG3, TMP5
+        | callp &MVM_sc_set_obj_sc
+        break;
+    }
+    case MVM_OP_scgethandle:
+    case MVM_OP_scobjcount: {
+        MVMint16 dst = ins->operands[0].reg.orig;
+        MVMint16 sc  = ins->operands[1].reg.orig;
+        MVMint32 dst_off = WORK_OFF(dst);
+        MVMint32 sc_off  = WORK_OFF(sc);
+        | ldr TMP5, [x21, #sc_off]
+        | cmp_repr_id TMP5, TMP6, MVM_REPR_ID_SCRef
+        | beq >1
+        if (op == MVM_OP_scgethandle) {
+            | throw_adhoc "Must provide an SCRef operand to scgethandle"
+        } else {
+            | throw_adhoc "Must provide an SCRef operand to scobjcount"
+        }
+        |1:
+        | mov ARG1, x19
+        | mov ARG2, TMP5
+        if (op == MVM_OP_scgethandle) {
+            | callp &MVM_sc_get_handle
+        } else {
+            | callp &MVM_sc_get_object_count
+        }
+        | str RV, [x21, #dst_off]
+        break;
+    }
+    case MVM_OP_getstdin:
+    case MVM_OP_getstdout:
+    case MVM_OP_getstderr: {
+        MVMint16 dst = ins->operands[0].reg.orig;
+        MVMint32 dst_off = WORK_OFF(dst);
+        | ldr TMP3, TC->instance
+        if (op == MVM_OP_getstdin) {
+            | ldr TMP3, MVMINSTANCE:TMP3->stdin_handle
+        } else if (op == MVM_OP_getstdout) {
+            | ldr TMP3, MVMINSTANCE:TMP3->stdout_handle
+        } else {
+            | ldr TMP3, MVMINSTANCE:TMP3->stderr_handle
+        }
+        | str TMP3, [x21, #dst_off]
+        break;
+    }
+    case MVM_OP_ordat:
+    case MVM_OP_ordbaseat:
+    case MVM_OP_ordfirst: {
+        MVMint16 dst = ins->operands[0].reg.orig;
+        MVMint16 str = ins->operands[1].reg.orig;
+        MVMint32 dst_off = WORK_OFF(dst);
+        MVMint32 str_off = WORK_OFF(str);
+        | mov ARG1, x19
+        | ldr ARG2, [x21, #str_off]
+        if (op == MVM_OP_ordat || op == MVM_OP_ordbaseat) {
+            MVMint16 idx = ins->operands[2].reg.orig;
+            MVMint32 idx_off = WORK_OFF(idx);
+            | ldr ARG3, [x21, #idx_off]
+        } else {
+            | mov ARG3, #0
+        }
+        if (op == MVM_OP_ordbaseat) {
+            | callp &MVM_string_ord_basechar_at
+        } else {
+            | callp &MVM_string_ord_at
+        }
+        | sxtw RV, w0
+        | str RV, [x21, #dst_off]
+        break;
+    }
+    case MVM_OP_getcodename: {
+        MVMint16 obj  = ins->operands[0].reg.orig;
+        MVMint16 code = ins->operands[1].reg.orig;
+        MVMint32 obj_off  = WORK_OFF(obj);
+        MVMint32 code_off = WORK_OFF(code);
+        | ldr TMP1, [x21, #code_off]
+        | cmp_repr_id TMP1, TMP2, MVM_REPR_ID_MVMCode
+        | bne >1
+        | test_type_object TMP1
+        | beq >2
+        |1:
+        | throw_adhoc "getcodename requires a concrete object"
+        |2:
+        | ldr TMP2, CODE:TMP1->body.name
+        | str TMP2, [x21, #obj_off]
+        break;
+    }
+    case MVM_OP_setcodeobj: {
+        MVMint16 obj  = ins->operands[0].reg.orig;
+        MVMint16 code = ins->operands[1].reg.orig;
+        MVMint32 obj_off  = WORK_OFF(obj);
+        MVMint32 code_off = WORK_OFF(code);
+        | ldr TMP1, [x21, #obj_off]
+        | cmp_repr_id TMP1, TMP2, MVM_REPR_ID_MVMCode
+        | beq >1
+        | throw_adhoc "setcodeobj needs a code ref"
+        |1:
+        | ldr TMP2, [x21, #code_off]
+        | str TMP2, CODE:TMP1->body.code_object
+        | check_wb TMP1, TMP2, >2
+        | hit_wb TMP1, TMP2
+        |2:
+        break;
+    }
+    case MVM_OP_setcodename: {
+        MVMint16 obj  = ins->operands[0].reg.orig;
+        MVMint16 code = ins->operands[1].reg.orig;
+        MVMint32 obj_off  = WORK_OFF(obj);
+        MVMint32 code_off = WORK_OFF(code);
+        | ldr TMP1, [x21, #obj_off]
+        | cmp_repr_id TMP1, TMP2, MVM_REPR_ID_MVMCode
+        | beq >1
+        | throw_adhoc "setcodename needs a code ref"
+        |1:
+        | ldr TMP2, [x21, #code_off]
+        | str TMP2, CODE:TMP1->body.name
+        | check_wb TMP1, TMP2, >2
+        | hit_wb TMP1, TMP2
+        |2:
+        break;
+    }
+    case MVM_OP_lastexpayload: {
+        MVMint16 dst = ins->operands[0].reg.orig;
+        MVMint32 dst_off = WORK_OFF(dst);
+        | ldr TMP3, TC->last_payload
+        | str TMP3, [x21, #dst_off]
+        break;
+    }
+    case MVM_OP_param_sp: {
+        MVMuint16 dst = ins->operands[0].reg.orig;
+        MVMuint16 off = ins->operands[1].lit_ui16;
+        MVMint32 dst_off = WORK_OFF(dst);
+        | mov ARG1, x19
+        | mov ARG2, #0
+        | mov ARG3, #off
+        | callp &MVM_args_slurpy_positional
+        | str RV, [x21, #dst_off]
+        break;
+    }
+    case MVM_OP_param_sn: {
+        MVMuint16 dst = ins->operands[0].reg.orig;
+        MVMint32 dst_off = WORK_OFF(dst);
+        | mov ARG1, x19
+        | mov ARG2, #0
+        | callp &MVM_args_slurpy_named
+        | str RV, [x21, #dst_off]
+        break;
+    }
+    case MVM_OP_sp_bindcomplete: {
+        MVMint16 spesh_idx = ins->operands[0].lit_i16;
+        MVMuint32 slot     = ins->operands[1].lit_ui32;
+        MVMint32 ic_off   = (MVMint32)offsetof(MVMStaticFrame, body.inline_cache);
+        MVMint32 entry_off = (MVMint32)(slot * sizeof(MVMDispInlineCacheEntry));
+        | mov ARG1, x19
+        | get_spesh_slot ARG2, spesh_idx
+        | add ARG2, ARG2, #ic_off
+        | ldr ARG2, MVMDISPINLINECACHE:ARG2->entries
+        | add ARG2, ARG2, #entry_off
+        | callp &MVM_args_bind_succeeded
+        break;
+    }
+    case MVM_OP_sp_cas_o: {
+        MVMint16 target   = ins->operands[1].reg.orig;
+        MVMint16 expected = ins->operands[2].reg.orig;
+        MVMint16 value    = ins->operands[3].reg.orig;
+        MVMint16 result   = ins->operands[0].reg.orig;
+        MVMint32 target_off   = WORK_OFF(target);
+        MVMint32 expected_off = WORK_OFF(expected);
+        MVMint32 value_off    = WORK_OFF(value);
+        MVMint32 result_off   = WORK_OFF(result);
+        | mov ARG1, x19
+        | ldr ARG2, [x21, #target_off]
+        | ldr ARG3, [x21, #expected_off]
+        | ldr ARG4, [x21, #value_off]
+        | add ARG5, x21, #result_off
+        | ldr FUNCTION, OBJECT:ARG2->st
+        | ldr FUNCTION, STABLE:FUNCTION->container_spec
+        | ldr FUNCTION, CONTAINERSPEC:FUNCTION->cas
+        | blr FUNCTION
+        break;
+    }
+    case MVM_OP_sp_atomicload_o: {
+        MVMint16 target = ins->operands[1].reg.orig;
+        MVMint16 result = ins->operands[0].reg.orig;
+        MVMint32 target_off = WORK_OFF(target);
+        MVMint32 result_off = WORK_OFF(result);
+        | mov ARG1, x19
+        | ldr ARG2, [x21, #target_off]
+        | ldr FUNCTION, OBJECT:ARG2->st
+        | ldr FUNCTION, STABLE:FUNCTION->container_spec
+        | ldr FUNCTION, CONTAINERSPEC:FUNCTION->load_atomic
+        | blr FUNCTION
+        | str RV, [x21, #result_off]
+        break;
+    }
+    case MVM_OP_sp_atomicstore_o: {
+        MVMint16 target = ins->operands[0].reg.orig;
+        MVMint16 value  = ins->operands[1].reg.orig;
+        MVMint32 target_off = WORK_OFF(target);
+        MVMint32 value_off  = WORK_OFF(value);
+        | mov ARG1, x19
+        | ldr ARG2, [x21, #target_off]
+        | ldr ARG3, [x21, #value_off]
+        | ldr FUNCTION, OBJECT:ARG2->st
+        | ldr FUNCTION, STABLE:FUNCTION->container_spec
+        | ldr FUNCTION, CONTAINERSPEC:FUNCTION->store_atomic
+        | blr FUNCTION
+        break;
+    }
+    case MVM_OP_hllbool: {
+        MVMint16 target = ins->operands[0].reg.orig;
+        MVMint16 value  = ins->operands[1].reg.orig;
+        MVMHLLConfig *hll_config = (MVMHLLConfig*)jg->sg->sf->body.cu->body.hll_config;
+        MVMint32 target_off = WORK_OFF(target);
+        MVMint32 value_off  = WORK_OFF(value);
+        | ldr TMP1, [x21, #value_off]
+        | cbnz TMP1, >1
+        arm64_mov64_tmp1(tc, compiler, (MVMuint64)(uintptr_t)hll_config->false_value);
+        | b >2
+        |1:
+        arm64_mov64_tmp1(tc, compiler, (MVMuint64)(uintptr_t)hll_config->true_value);
+        |2:
+        | str TMP1, [x21, #target_off]
+        break;
+    }
+    case MVM_OP_hllboolfor: {
+        MVMint16 target = ins->operands[0].reg.orig;
+        MVMint16 value  = ins->operands[1].reg.orig;
+        MVMHLLConfig *hll_config = (MVMHLLConfig*)(uintptr_t)ins->operands[2].lit_i64;
+        MVMint32 target_off = WORK_OFF(target);
+        MVMint32 value_off  = WORK_OFF(value);
+        | ldr TMP1, [x21, #value_off]
+        | cbnz TMP1, >1
+        arm64_mov64_tmp1(tc, compiler, (MVMuint64)(uintptr_t)hll_config->false_value);
+        | b >2
+        |1:
+        arm64_mov64_tmp1(tc, compiler, (MVMuint64)(uintptr_t)hll_config->true_value);
+        |2:
+        | str TMP1, [x21, #target_off]
+        break;
+    }
+    case MVM_OP_newtype: {
+        MVMint16 dst  = ins->operands[0].reg.orig;
+        MVMint16 how  = ins->operands[1].reg.orig;
+        MVMint16 name = ins->operands[2].reg.orig;
+        MVMint32 dst_off  = WORK_OFF(dst);
+        MVMint32 how_off  = WORK_OFF(how);
+        MVMint32 name_off = WORK_OFF(name);
+        | mov ARG1, x19
+        | ldr ARG2, [x21, #name_off]
+        | callp &MVM_repr_get_by_name
+        | ldr FUNCTION, REPR:RV->type_object_for
+        | mov ARG1, x19
+        | ldr ARG2, [x21, #how_off]
+        | blr FUNCTION
+        | str RV, [x21, #dst_off]
+        break;
+    }
+    case MVM_OP_newmixintype: {
+        MVMint16 dst  = ins->operands[0].reg.orig;
+        MVMint16 how  = ins->operands[1].reg.orig;
+        MVMint16 name = ins->operands[2].reg.orig;
+        MVMint32 dst_off  = WORK_OFF(dst);
+        MVMint32 how_off  = WORK_OFF(how);
+        MVMint32 name_off = WORK_OFF(name);
+        | mov ARG1, x19
+        | ldr ARG2, [x21, #name_off]
+        | callp &MVM_repr_get_by_name
+        | ldr FUNCTION, REPR:RV->type_object_for
+        | mov ARG1, x19
+        | ldr ARG2, [x21, #how_off]
+        | blr FUNCTION
+        | ldr TMP1, OBJECT:RV->st
+        | mov w10, #1
+        | str w10, STABLE:TMP1->is_mixin_type
+        | str RV, [x21, #dst_off]
+        break;
+    }
+    case MVM_OP_composetype: {
+        MVMint16 dst  = ins->operands[0].reg.orig;
+        MVMint16 obj  = ins->operands[1].reg.orig;
+        MVMint16 type = ins->operands[2].reg.orig;
+        MVMint32 dst_off  = WORK_OFF(dst);
+        MVMint32 obj_off  = WORK_OFF(obj);
+        MVMint32 type_off = WORK_OFF(type);
+        | ldr TMP6, [x21, #obj_off]
+        | ldr FUNCTION, OBJECT:TMP6->st
+        | ldr FUNCTION, STABLE:FUNCTION->REPR
+        | ldr FUNCTION, REPR:FUNCTION->compose
+        | mov ARG1, x19
+        | get_stable ARG2, TMP6
+        | ldr ARG3, [x21, #type_off]
+        | blr FUNCTION
+        | ldr TMP1, [x21, #obj_off]
+        | str TMP1, [x21, #dst_off]
+        break;
+    }
+    case MVM_OP_sp_fastbox_i:
+    case MVM_OP_sp_fastbox_u:
+    case MVM_OP_sp_fastbox_i_ic:
+    case MVM_OP_sp_fastbox_u_ic: {
+        MVMint32 use_cache = (op == MVM_OP_sp_fastbox_i_ic || op == MVM_OP_sp_fastbox_u_ic);
+        MVMint16 dst    = ins->operands[0].reg.orig;
+        MVMint16 offset = ins->operands[3].lit_i16;
+        MVMint16 val    = ins->operands[4].reg.orig;
+        MVMint32 dst_off = WORK_OFF(dst);
+        MVMint32 val_off = WORK_OFF(val);
+        if (use_cache) {
+            MVMObject **cache = tc->instance->int_const_cache->cache[ins->operands[5].lit_i16];
+            /* TMP2=x10 holds index (val+1), TMP1=x9 holds cache ptr */
+            | ldr TMP2, [x21, #val_off]
+            | cmp TMP2, #14
+            | bgt >1
+            | cmn TMP2, #1
+            | blt >1
+            | add TMP2, TMP2, #1
+            arm64_mov64_tmp1(tc, compiler, (MVMuint64)(uintptr_t)cache);
+            | ldr TMP1, [TMP1, TMP2, lsl #3]
+            | str TMP1, [x21, #dst_off]
+            | b >2
+            |1:
+        }
+        arm64_emit_fastcreate(tc, compiler, jg, ins);
+        | str RV, [x21, #dst_off]
+        | ldr TMP3, [x21, #val_off]
+        | str TMP3, [RV, #offset]
+        if (use_cache)
+            |2:
+        break;
+    }
+    case MVM_OP_sp_fastbox_bi:
+    case MVM_OP_sp_fastbox_bi_ic:
+        MVM_oops(tc, "ARM64 JIT: sp_fastbox_bi not yet implemented");
+        break;
+    case MVM_OP_sp_add_I:
+    case MVM_OP_sp_sub_I:
+    case MVM_OP_sp_mul_I:
+        MVM_oops(tc, "ARM64 JIT: bigint arithmetic ops not yet implemented");
+        break;
+    case MVM_OP_sp_bool_I:
+        MVM_oops(tc, "ARM64 JIT: sp_bool_I not yet implemented");
+        break;
+    case MVM_OP_sp_boolify_iter_arr:
+        MVM_oops(tc, "ARM64 JIT: sp_boolify_iter_arr not yet implemented");
+        break;
+    case MVM_OP_getcomp: {
+        MVMint16 dst  = ins->operands[0].reg.orig;
+        MVMint16 comp = ins->operands[1].reg.orig;
+        MVMint32 dst_off  = WORK_OFF(dst);
+        MVMint32 comp_off = WORK_OFF(comp);
+        | ldr ARG1, TC->instance
+        | add ARG1, ARG1, #offsetof(MVMInstance, mutex_compiler_registry)
+        | callp &uv_mutex_lock
+        | mov ARG1, x19
+        | ldr ARG2, TC->instance
+        | ldr ARG2, MVMINSTANCE:ARG2->compiler_registry
+        | ldr ARG3, [x21, #comp_off]
+        | callp &MVM_repr_at_key_o
+        | str RV, [x21, #dst_off]
+        | ldr ARG1, TC->instance
+        | add ARG1, ARG1, #offsetof(MVMInstance, mutex_compiler_registry)
+        | callp &uv_mutex_unlock
+        break;
+    }
+    default:
+        MVM_oops(tc, "ARM64 JIT: emit_primitive: unimplemented op '%s'", ins->info->name);
+    }
 }
 
 void MVM_jit_emit_call_c(MVMThreadContext *tc, MVMJitCompiler *compiler,
                          MVMJitGraph *jg, MVMJitCallC *call_spec) {
-    emit_arm64_callargs(tc, compiler, jg, call_spec->args, call_spec->num_args);
-    | callp call_spec->func_ptr
+    MVMint32 sp_adj = emit_arm64_callargs(tc, compiler, jg, call_spec->args, call_spec->num_args);
+    if (sp_adj > 0) {
+        /* sp was adjusted for stack args — use blr directly (callp would use
+         * [sp,#40] which is no longer the trampoline slot).  call_c functions
+         * don't dispatch MoarVM frames, so the trampoline isn't needed. */
+        arm64_mov64_tmp1(tc, compiler, (MVMuint64)(uintptr_t)(call_spec->func_ptr));
+        | mov FUNCTION, TMP1
+        | blr FUNCTION
+        | add sp, sp, #sp_adj
+    } else {
+        | callp call_spec->func_ptr
+    }
 
     switch (call_spec->rv_mode) {
     case MVM_JIT_RV_VOID:
@@ -790,25 +3033,16 @@ void MVM_jit_emit_deopt_check(MVMThreadContext *tc, MVMJitCompiler *compiler) {
 
 void MVM_jit_emit_runbytecode(MVMThreadContext *tc, MVMJitCompiler *compiler,
                               MVMJitGraph *jg, MVMJitRunByteCode *runcode) {
-    MVMint16 i;
     MVMint32 code_off = runcode->code_register * (MVMint32)sizeof(MVMRegister);
-
-    /* Store arg map in data section at label 5 */
-    | .data
-    |5:
-    {
-        MVMuint32 flag_count = runcode->callsite->flag_count;
-        MVMuint32 fi;
-        for (fi = 0; fi + 2 <= flag_count; fi += 2) {
-            MVMuint32 packed = (MVMuint32)(MVMuint16)runcode->map[fi].reg.orig | ((MVMuint32)(MVMuint16)runcode->map[fi+1].reg.orig << 16);
-            | .long packed
-        }
-        if (flag_count & 1) {
-            MVMuint32 last = (MVMuint32)(MVMuint16)runcode->map[flag_count-1].reg.orig;
-            | .long last
-        }
-    }
-    | .code
+    /* Uses pre-allocated space in the 160-byte prologue frame (sp never adjusted):
+     * [sp+ 48..55]: MVMArgs.callsite
+     * [sp+ 56..63]: MVMArgs.source  (= x21, current JIT frame's work)
+     * [sp+ 64..71]: MVMArgs.map     (pointer to arg indices in JIT code data section)
+     * [sp+ 72..79]: padding
+     *
+     * arg_indices are emitted into the JIT code data section (not the C stack)
+     * so args.map remains valid after the JIT epilogue frees the C stack frame.
+     */
 
     /* Set up frame return info */
     | get_cur_op TMP2
@@ -828,56 +3062,76 @@ void MVM_jit_emit_runbytecode(MVMThreadContext *tc, MVMJitCompiler *compiler,
         | str TMP2, FRAME:TMP5->return_value
     }
 
-    /* On AAPCS64 MVMArgs (24 bytes > 16) is passed by hidden pointer.
-     * Allocate 32 bytes on stack (16-byte aligned), fill MVMArgs fields. */
-    | sub sp, sp, #32
     | .data
-    | 6:
+    | 5:
     | .quad (uintptr_t)(runcode->callsite)
     | .code
-    | ldr TMP6, <6
-    | str TMP6, [sp]
-    | ldr TMP6, TC->interp_reg_base
-    | ldr TMP6, [TMP6]
-    | str TMP6, [sp, #8]
-    | adr TMP6, <5
-    | str TMP6, [sp, #16]
+    | ldr TMP6, <5
+    | str TMP6, [sp, #48]
+    | str x21, [sp, #56]
+
+    /* Emit arg indices into data section; args.map points there.
+     * Packed as pairs of uint16 into .long (4-byte) values, little-endian. */
+    {
+        MVMuint32 flag_count = runcode->callsite->flag_count;
+        MVMuint32 fi;
+        | .data
+        | 8:
+        for (fi = 0; fi + 2 <= flag_count; fi += 2) {
+            MVMuint32 lo = (MVMuint16)runcode->map[fi].reg.orig;
+            MVMuint32 hi = (MVMuint16)runcode->map[fi+1].reg.orig;
+            MVMuint32 packed = lo + (hi << 16);
+            | .long packed
+        }
+        if (flag_count & 1) {
+            MVMuint32 last = (MVMuint16)runcode->map[flag_count-1].reg.orig;
+            | .long last
+        }
+        | .code
+        | adr TMP6, <8
+        | str TMP6, [sp, #64]
+    }
 
     | mov ARG1, x19
     | ldr ARG2, [x21, #code_off]
-    | mov ARG3, sp
-    | mov ARG4, #runcode->spesh_cand
-
-    /* Use label 7 for function pointer to avoid conflict with label 5 (arg map) */
+    | add ARG3, sp, #48
     | .data
     | 7:
+    | .quad (uintptr_t)(runcode->spesh_cand)
+    | .code
+    | ldr ARG4, <7
+
+    | .data
+    | 6:
     | .quad (uintptr_t)(&MVM_frame_dispatch)
     | .code
-    | ldr FUNCTION, <7
+    | ldr FUNCTION, <6
+    | adr x17, >9
+    | str x17, [sp, #40]
     | blr FUNCTION
-    | add sp, sp, #32
+    | ldr x17, [sp, #40]
+    | br x17
+    |9:
+    /* NOTE: label 9 is the re-entry point that jit_return_address refers to.
+     * The deopt label registered after this instruction (DEOPT_ALL_INS) must
+     * land at exactly this address so that a deopt of a suspended frame maps
+     * the re-entry position to the correct deopt_idx. Do NOT emit any
+     * instructions between here and the end of this function. */
 }
 
 void MVM_jit_emit_runccode(MVMThreadContext *tc, MVMJitCompiler *compiler,
                            MVMJitGraph *jg, MVMJitRunCCode *runcode) {
-    MVMint16 i;
-
-    /* Store arg map at label 5 */
-    | .data
-    |5:
-    {
-        MVMuint32 flag_count = runcode->callsite->flag_count;
-        MVMuint32 fi;
-        for (fi = 0; fi + 2 <= flag_count; fi += 2) {
-            MVMuint32 packed = (MVMuint32)(MVMuint16)runcode->map[fi].reg.orig | ((MVMuint32)(MVMuint16)runcode->map[fi+1].reg.orig << 16);
-            | .long packed
-        }
-        if (flag_count & 1) {
-            MVMuint32 last = (MVMuint32)(MVMuint16)runcode->map[flag_count-1].reg.orig;
-            | .long last
-        }
-    }
-    | .code
+    /* Uses pre-allocated space in the 160-byte prologue frame (sp never adjusted):
+     * [sp+ 48..55]: MVMArgs.callsite
+     * [sp+ 56..63]: MVMArgs.source  (= x21, current JIT frame's work)
+     * [sp+ 64..71]: MVMArgs.map     (pointer to arg indices in JIT code data section)
+     * [sp+ 72..79]: padding
+     * [sp+ 40]:     trampoline slot — callp reads/writes here to intercept
+     *               frame dispatches that happen inside the called function.
+     *
+     * arg_indices are emitted into the JIT code data section (not the C stack)
+     * so args.map remains valid if a frame dispatch trampolines out.
+     */
 
     /* Set up frame return info */
     | get_cur_op TMP2
@@ -897,23 +3151,42 @@ void MVM_jit_emit_runccode(MVMThreadContext *tc, MVMJitCompiler *compiler,
         | str TMP2, FRAME:TMP5->return_value
     }
 
-    /* Build MVMArgs on stack (AAPCS64: struct > 16 bytes passed by pointer) */
-    | sub sp, sp, #32
+    /* Build MVMArgs in the prologue's pre-allocated slots */
     | .data
     | 6:
     | .quad (uintptr_t)(runcode->callsite)
     | .code
     | ldr TMP6, <6
-    | str TMP6, [sp]
-    | ldr TMP6, TC->interp_reg_base
-    | ldr TMP6, [TMP6]
-    | str TMP6, [sp, #8]
-    | adr TMP6, <5
-    | str TMP6, [sp, #16]
+    | str TMP6, [sp, #48]
+    | str x21, [sp, #56]
+
+    /* Emit arg indices into data section; args.map points there.
+     * Packed as pairs of uint16 into .long (4-byte) values, little-endian. */
+    {
+        MVMuint32 flag_count = runcode->callsite->flag_count;
+        MVMuint32 fi;
+        | .data
+        | 8:
+        for (fi = 0; fi + 2 <= flag_count; fi += 2) {
+            MVMuint32 lo = (MVMuint16)runcode->map[fi].reg.orig;
+            MVMuint32 hi = (MVMuint16)runcode->map[fi+1].reg.orig;
+            MVMuint32 packed = lo + (hi << 16);
+            | .long packed
+        }
+        if (flag_count & 1) {
+            MVMuint32 last = (MVMuint16)runcode->map[flag_count-1].reg.orig;
+            | .long last
+        }
+        | .code
+        | adr TMP6, <8
+        | str TMP6, [sp, #64]
+    }
 
     | mov ARG1, x19
-    | mov ARG2, sp
+    | add ARG2, sp, #48
 
+    /* Load the function address, then do an inline callp so the trampoline
+     * can intercept any frame dispatch that occurs inside the function. */
     MVMSpeshFacts *function_facts =
         MVM_spesh_get_facts(tc, jg->sg, runcode->code_operand);
     if ((function_facts->flags & MVM_SPESH_FACT_KNOWN_VALUE) && function_facts->value.o) {
@@ -924,14 +3197,17 @@ void MVM_jit_emit_runccode(MVMThreadContext *tc, MVMJitCompiler *compiler,
         | .quad call_target
         | .code
         | ldr FUNCTION, <7
-        | blr FUNCTION
     } else {
         MVMint32 code_op_off = runcode->code_operand.reg.orig * (MVMint32)sizeof(MVMRegister);
         | ldr FUNCTION, [x21, #code_op_off]
         | ldr FUNCTION, CFUNCTION:FUNCTION->body.func
-        | blr FUNCTION
     }
-    | add sp, sp, #32
+    | adr x17, >9
+    | str x17, [sp, #40]
+    | blr FUNCTION
+    | ldr x17, [sp, #40]
+    | br x17
+    |9:
 }
 
 void MVM_jit_emit_runnativecall(MVMThreadContext *tc, MVMJitCompiler *compiler,
@@ -955,7 +3231,7 @@ void MVM_jit_emit_runnativecall(MVMThreadContext *tc, MVMJitCompiler *compiler,
     }
 
     /* Set up call arguments */
-    emit_arm64_callargs(tc, compiler, jg, runcode->args, runcode->num_args);
+    MVMint32 nc_sp_adj = emit_arm64_callargs(tc, compiler, jg, runcode->args, runcode->num_args);
 
     /* Call the native function */
     | .data
@@ -964,6 +3240,9 @@ void MVM_jit_emit_runnativecall(MVMThreadContext *tc, MVMJitCompiler *compiler,
     | .code
     | ldr FUNCTION, <5
     | blr FUNCTION
+    if (nc_sp_adj > 0) {
+        | add sp, sp, #nc_sp_adj
+    }
 
     if (runcode->return_type != MVM_RETURN_VOID) {
         MVMint32 rv_off = runcode->return_register * (MVMint32)sizeof(MVMRegister);
@@ -989,14 +3268,30 @@ void MVM_jit_emit_runnativecall(MVMThreadContext *tc, MVMJitCompiler *compiler,
     }
 }
 
+/* 8-arg wrapper for run_dispatch that hides the 9th stack arg (bytecode_offset).
+ * ARM64 AAPCS64 requires the 9th arg at [SP] at call time, which would force
+ * the JIT to do sub/add sp around the call and break the trampoline slot.
+ * This thunk takes only register args and passes bytecode_offset=-1 internally. */
+static void MVM_jit_dispatch_thunk(
+        MVMThreadContext *tc,
+        MVMDispInlineCacheEntry **entry_ptr,
+        MVMDispInlineCacheEntry *seen,
+        MVMString *id,
+        MVMCallsite *callsite,
+        MVMuint16 *arg_indices,
+        MVMRegister *source,
+        MVMStaticFrame *sf) {
+    seen->run_dispatch(tc, entry_ptr, seen, id, callsite, arg_indices, source, sf, (MVMuint32)-1);
+}
+
 void MVM_jit_emit_dispatch(MVMThreadContext *tc, MVMJitCompiler *compiler,
                            MVMJitGraph *jg, MVMJitDispatch *dispatch) {
     MVMint16 i;
     MVMuint64 slot_off = (MVMuint64)dispatch->ice_slot * sizeof(void *);
 
-    /* Arg map at label 5 */
+    /* Arg map at label 7 (not 5: callp reuses label 5 for its function pointer) */
     | .data
-    |5:
+    |7:
     {
         MVMuint32 flag_count = dispatch->callsite->flag_count;
         MVMuint32 fi;
@@ -1048,18 +3343,14 @@ void MVM_jit_emit_dispatch(MVMThreadContext *tc, MVMJitCompiler *compiler,
     | .quad (uintptr_t)(dispatch->callsite)
     | .code
     | ldr ARG5, <6
-    | adr ARG6, <5
+    | adr ARG6, <7
     | mov x6, x21
     | mov x7, TMP6
 
-    /* 9th arg (bytecode_offset = -1) on stack */
-    | sub sp, sp, #16
-    | mov TMP1, #-1
-    | str TMP1, [sp]
-
-    | ldr FUNCTION, MVMDISPINLINECACHEENTRY:ARG3->run_dispatch
-    | blr FUNCTION
-    | add sp, sp, #16
+    /* Call the 8-arg thunk via callp — sp stays at prologue_sp so the
+     * trampoline slot [sp+40] is live.  The thunk passes bytecode_offset=-1
+     * internally as a stack argument without disturbing our frame. */
+    | callp &MVM_jit_dispatch_thunk
 }
 
 void MVM_jit_emit_istype(MVMThreadContext *tc, MVMJitCompiler *compiler,
@@ -1080,9 +3371,9 @@ void MVM_jit_emit_istype(MVMThreadContext *tc, MVMJitCompiler *compiler,
         MVMStaticFrame *sf = (MVMStaticFrame *)jg->sg->spesh_slots[istype->sf_slot];
         MVMHLLConfig *hll = sf->body.cu->body.hll_config;
         if (hll->istype_dispatcher) {
-            /* Arg map at label 5 */
+            /* Arg map at label 3 (not 5: callp reuses label 5 for its function pointer) */
             | .data
-            |5:
+            |3:
             {
                 MVMuint32 packed = (MVMuint32)(MVMuint16)istype->obj_register | ((MVMuint32)(MVMuint16)istype->type_register << 16);
                 | .long packed
@@ -1122,16 +3413,11 @@ void MVM_jit_emit_istype(MVMThreadContext *tc, MVMJitCompiler *compiler,
             | .quad (uintptr_t)callsite
             | .code
             | ldr ARG5, <7
-            | adr ARG6, <5
+            | adr ARG6, <3
             | mov x6, x21
             | mov x7, TMP6
 
-            | sub sp, sp, #16
-            | mov TMP1, #-1
-            | str TMP1, [sp]
-            | ldr FUNCTION, MVMDISPINLINECACHEENTRY:ARG3->run_dispatch
-            | blr FUNCTION
-            | add sp, sp, #16
+            | callp &MVM_jit_dispatch_thunk
         }
     }
 }
