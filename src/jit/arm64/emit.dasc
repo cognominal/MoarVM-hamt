@@ -180,8 +180,9 @@
 #define WORK_OFF(r) ((MVMint32)((r) * (MVMint32)sizeof(MVMRegister)))
 
 /* x-register numbers for the register aliases, for use with Rx(). */
-enum { ARM64_REG_ARG3 = 2, ARM64_REG_ARG4 = 3, ARM64_REG_ARG5 = 4,
-       ARM64_REG_TMP2 = 10, ARM64_REG_TMP6 = 14 };
+enum { ARM64_REG_ARG2 = 1, ARM64_REG_ARG3 = 2, ARM64_REG_ARG4 = 3,
+       ARM64_REG_ARG5 = 4, ARM64_REG_TMP1 = 9, ARM64_REG_TMP2 = 10,
+       ARM64_REG_TMP6 = 14 };
 
 /* Emit `add Rx(dst), x21, #off`, the address of a work register.  The ADD
  * immediate is only 12 bits (<= 4095); work offsets in large frames can
@@ -196,6 +197,21 @@ static void arm64_lea_work(MVMThreadContext *tc, MVMJitCompiler *compiler,
             | movk Rx(dst), #((off >> 16) & 0xffff), lsl #16
         }
         | add Rx(dst), x21, Rx(dst)
+    }
+}
+
+/* Emit `add Rx(reg), Rx(reg), #off`, materializing offsets that exceed the
+ * 12-bit ADD immediate through Rx(scratch) (which must differ from reg). */
+static void arm64_add_off(MVMThreadContext *tc, MVMJitCompiler *compiler,
+                          int reg, int scratch, MVMint32 off) {
+    if (off < 4096) {
+        | add Rx(reg), Rx(reg), #off
+    } else {
+        | movz Rx(scratch), #(off & 0xffff)
+        if (off >> 16) {
+            | movk Rx(scratch), #((off >> 16) & 0xffff), lsl #16
+        }
+        | add Rx(reg), Rx(reg), Rx(scratch)
     }
 }
 
@@ -2256,7 +2272,7 @@ void MVM_jit_emit_primitive(MVMThreadContext *tc, MVMJitCompiler *compiler,
         | get_spesh_slot ARG2, spesh_idx
         | add ARG2, ARG2, #ic_off
         | ldr ARG2, MVMDISPINLINECACHE:ARG2->entries
-        | add ARG2, ARG2, #entry_off
+        arm64_add_off(tc, compiler, ARM64_REG_ARG2, ARM64_REG_TMP1, entry_off);
         | ldr ARG3, [x21, #name_off]
         | ldr FUNCTION, [ARG2]
         | ldr FUNCTION, MVMDISPINLINECACHEENTRY:FUNCTION->run_getlexstatic
@@ -2306,7 +2322,7 @@ void MVM_jit_emit_primitive(MVMThreadContext *tc, MVMJitCompiler *compiler,
         | get_spesh_slot ARG2, spesh_idx
         | add ARG2, ARG2, #ic_off
         | ldr ARG2, MVMDISPINLINECACHE:ARG2->entries
-        | add ARG2, ARG2, #entry_off
+        arm64_add_off(tc, compiler, ARM64_REG_ARG2, ARM64_REG_TMP1, entry_off);
         | callp &MVM_args_bind_failed
         |1:
         break;
@@ -2520,7 +2536,7 @@ void MVM_jit_emit_primitive(MVMThreadContext *tc, MVMJitCompiler *compiler,
         | get_spesh_slot ARG2, spesh_idx
         | add ARG2, ARG2, #ic_off
         | ldr ARG2, MVMDISPINLINECACHE:ARG2->entries
-        | add ARG2, ARG2, #entry_off
+        arm64_add_off(tc, compiler, ARM64_REG_ARG2, ARM64_REG_TMP1, entry_off);
         | callp &MVM_args_bind_succeeded
         break;
     }
