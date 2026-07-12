@@ -109,7 +109,13 @@
 |.macro get_spesh_slot, reg, idx
 | ldr reg, TC->cur_frame
 | ldr reg, FRAME:reg->effective_spesh_slots
+|| if ((MVMuint32)((idx)*8) < 32760) {
 | ldr reg, [reg, #((idx)*8)]
+|| } else {
+| movz x17, #((MVMuint32)((idx)*8) & 0xffff)
+| movk x17, #(((MVMuint32)((idx)*8) >> 16) & 0xffff), lsl #16
+| ldr reg, [reg, x17]
+|| }
 |.endmacro
 
 |.macro get_vmnull, reg
@@ -125,7 +131,13 @@
 |.macro get_string, reg, idx
 || MVM_cu_ensure_string_decoded(tc, jg->sg->sf->body.cu, idx);
 | ldr reg, CU->body.strings
+|| if ((MVMuint32)((idx)*8) < 32760) {
 | ldr reg, [reg, #((idx)*8)]
+|| } else {
+| movz x17, #((MVMuint32)((idx)*8) & 0xffff)
+| movk x17, #(((MVMuint32)((idx)*8) >> 16) & 0xffff), lsl #16
+| ldr reg, [reg, x17]
+|| }
 |.endmacro
 
 /* Test if an object is a type object (non-concrete).
@@ -1125,7 +1137,9 @@ void MVM_jit_emit_primitive(MVMThreadContext *tc, MVMJitCompiler *compiler,
         } else if (op == MVM_OP_sp_p6oget_bi) {
             /* big integer body */
             | ldr w9, BIGINTBODY:TMP2->u.smallint.flag
-            | cmp w9, #MVM_BIGINT_32_FLAG
+            /* MVM_BIGINT_32_FLAG is 0xFFFFFFFF (== -1); the CMP immediate can't
+             * encode it, so test w9 == -1 via CMN. */
+            | cmn w9, #1
             | bne >5
             | ldrsw TMP3, BIGINTBODY:TMP2->u.smallint.value
             | b >6
@@ -2679,8 +2693,11 @@ void MVM_jit_emit_primitive(MVMThreadContext *tc, MVMJitCompiler *compiler,
     case MVM_OP_sp_fastbox_i:
     case MVM_OP_sp_fastbox_u:
     case MVM_OP_sp_fastbox_i_ic:
-    case MVM_OP_sp_fastbox_u_ic: {
-        MVMint32 use_cache = (op == MVM_OP_sp_fastbox_i_ic || op == MVM_OP_sp_fastbox_u_ic);
+    case MVM_OP_sp_fastbox_u_ic:
+    case MVM_OP_sp_fastbox_bi:
+    case MVM_OP_sp_fastbox_bi_ic: {
+        MVMint32 use_cache = op == MVM_OP_sp_fastbox_i_ic || op == MVM_OP_sp_fastbox_u_ic || op == MVM_OP_sp_fastbox_bi_ic;
+        MVMint32 is_bi = op == MVM_OP_sp_fastbox_bi || op == MVM_OP_sp_fastbox_bi_ic;
         MVMint16 dst    = ins->operands[0].reg.orig;
         MVMint16 offset = ins->operands[3].lit_i16;
         MVMint16 val    = ins->operands[4].reg.orig;
@@ -2704,15 +2721,31 @@ void MVM_jit_emit_primitive(MVMThreadContext *tc, MVMJitCompiler *compiler,
         arm64_emit_fastcreate(tc, compiler, jg, ins);
         | str RV, [x21, #dst_off]
         | ldr TMP3, [x21, #val_off]
-        | str TMP3, [RV, #offset]
+        if (!is_bi) {
+            | str TMP3, [RV, #offset]
+        } else {
+            /* Big integer: if it fits in an int32, poke it in directly with the
+             * smallint flag; otherwise call out to build an mp_int. TMP3=x11. */
+            MVMint32 val_offset = offset + 4;
+            | sxtw TMP4, w11
+            | cmp TMP4, TMP3
+            | bne >3
+            | movz w12, #(MVM_BIGINT_32_FLAG & 0xffff)
+            | movk w12, #((MVM_BIGINT_32_FLAG >> 16) & 0xffff), lsl #16
+            | str w12, [RV, #offset]
+            | str w11, [RV, #val_offset]
+            | b >4
+            |3:
+            | mov ARG1, x19
+            | add ARG2, RV, #offset
+            | mov ARG3, TMP3
+            | callp &MVM_p6bigint_store_as_mp_int
+            |4:
+        }
         if (use_cache)
             |2:
         break;
     }
-    case MVM_OP_sp_fastbox_bi:
-    case MVM_OP_sp_fastbox_bi_ic:
-        MVM_oops(tc, "ARM64 JIT: sp_fastbox_bi not yet implemented");
-        break;
     case MVM_OP_sp_add_I:
     case MVM_OP_sp_sub_I:
     case MVM_OP_sp_mul_I:

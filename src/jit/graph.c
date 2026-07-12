@@ -4194,6 +4194,21 @@ MVMJitGraph * MVM_jit_try_make_graph(MVMThreadContext *tc, MVMSpeshGraph *sg) {
         return NULL;
     }
 
+    /* Debug/bring-up aid: MVM_JIT_SKIP_FRAME=substr disables JIT for frames
+     * whose name contains the substring (they fall back to spesh bytecode),
+     * for bisecting which JIT'd frame is miscompiled. Inert when unset. */
+    {
+        const char *skip = getenv("MVM_JIT_SKIP_FRAME");
+        if (skip && *skip && sg->sf && sg->sf->body.name) {
+            char *nm = MVM_string_utf8_encode_C_string(tc, sg->sf->body.name);
+            int hit = nm && strstr(nm, skip) != NULL;
+            if (nm)
+                MVM_free(nm);
+            if (hit)
+                return NULL;
+        }
+    }
+
     MVM_spesh_iterator_init(tc, &iter, sg);
     /* ignore first BB, which always contains a NOP */
     MVM_spesh_iterator_next_bb(tc, &iter);
