@@ -2736,8 +2736,10 @@ void MVM_jit_emit_primitive(MVMThreadContext *tc, MVMJitCompiler *compiler,
             | str w11, [RV, #val_offset]
             | b >4
             |3:
-            | mov ARG1, x19
+            /* NB: RV and ARG1 are both x0, so compute ARG2 = RV+offset BEFORE
+             * loading tc into ARG1 (which would clobber RV). */
             | add ARG2, RV, #offset
+            | mov ARG1, x19
             | mov ARG3, TMP3
             | callp &MVM_p6bigint_store_as_mp_int
             |4:
@@ -2808,15 +2810,16 @@ void MVM_jit_emit_primitive(MVMThreadContext *tc, MVMJitCompiler *compiler,
         | b >3
         |1:
         /* Slow path: allocate the result, then call the bigint fallback.
-         * Read the arg bodies before storing the result, in case c == a/b. */
+         * NB: RV and ARG1 are both x0, so consume RV (store result, compute
+         * ARG4 = RV+offset) BEFORE loading tc into ARG1. */
         arm64_emit_fastcreate(tc, compiler, jg, ins);
+        | str RV, [x21, #c_off]
+        | add ARG4, RV, #offset
         | mov ARG1, x19
         | ldr ARG2, [x21, #a_off]
         | add ARG2, ARG2, #offset
         | ldr ARG3, [x21, #b_off]
         | add ARG3, ARG3, #offset
-        | str RV, [x21, #c_off]
-        | add ARG4, RV, #offset
         switch (op) {
         case MVM_OP_sp_add_I:
             | callp &MVM_bigint_fallback_add
