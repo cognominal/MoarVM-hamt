@@ -2748,15 +2748,128 @@ void MVM_jit_emit_primitive(MVMThreadContext *tc, MVMJitCompiler *compiler,
     }
     case MVM_OP_sp_add_I:
     case MVM_OP_sp_sub_I:
-    case MVM_OP_sp_mul_I:
-        MVM_oops(tc, "ARM64 JIT: bigint arithmetic ops not yet implemented");
+    case MVM_OP_sp_mul_I: {
+        MVMint16 a = ins->operands[3].reg.orig;
+        MVMint16 b = ins->operands[4].reg.orig;
+        MVMint16 c = ins->operands[0].reg.orig;
+        MVMint16 offset = ins->operands[5].lit_i16;
+        MVMint16 val_offset = offset + 4;
+        MVMObject **cache = tc->instance->int_const_cache->cache[ins->operands[6].lit_i16];
+        MVMint32 a_off = WORK_OFF(a), b_off = WORK_OFF(b), c_off = WORK_OFF(c);
+        /* Both smallint? (flag == MVM_BIGINT_32_FLAG == -1) */
+        | ldr TMP1, [x21, #a_off]
+        | ldr TMP2, [x21, #b_off]
+        | ldr w12, [TMP1, #offset]
+        | cmn w12, #1
+        | bne >1
+        | ldr w12, [TMP2, #offset]
+        | cmn w12, #1
+        | bne >1
+        /* Both smallint; try the arithmetic, falling back on overflow. */
+        | ldr w12, [TMP1, #val_offset]
+        | ldr w13, [TMP2, #val_offset]
+        switch (op) {
+        case MVM_OP_sp_add_I:
+            | adds w12, w12, w13
+            | bvs >1
+            break;
+        case MVM_OP_sp_sub_I:
+            | subs w12, w12, w13
+            | bvs >1
+            break;
+        case MVM_OP_sp_mul_I:
+            | smull TMP4, w12, w13
+            | sxtw TMP6, w12
+            | cmp TMP6, TMP4
+            | bne >1
+            break;
+        }
+        /* No overflow; w12 is the int32 result. In integer cache range? */
+        | cmp w12, #14
+        | bgt >2
+        | cmn w12, #1
+        | blt >2
+        | add w12, w12, #1
+        arm64_mov64_tmp1(tc, compiler, (MVMuint64)(uintptr_t)cache);
+        | ldr TMP2, [TMP1, w12, uxtw #3]
+        | str TMP2, [x21, #c_off]
+        | b >3
+        |2:
+        /* Out of cache range: fastcreate a smallint. Spill the value over the
+         * allocation (which clobbers caller-saved regs) via [sp+48]. */
+        | str w12, [sp, #48]
+        arm64_emit_fastcreate(tc, compiler, jg, ins);
+        | str RV, [x21, #c_off]
+        | ldr w12, [sp, #48]
+        | movz w13, #(MVM_BIGINT_32_FLAG & 0xffff)
+        | movk w13, #((MVM_BIGINT_32_FLAG >> 16) & 0xffff), lsl #16
+        | str w13, [RV, #offset]
+        | str w12, [RV, #val_offset]
+        | b >3
+        |1:
+        /* Slow path: allocate the result, then call the bigint fallback.
+         * Read the arg bodies before storing the result, in case c == a/b. */
+        arm64_emit_fastcreate(tc, compiler, jg, ins);
+        | mov ARG1, x19
+        | ldr ARG2, [x21, #a_off]
+        | add ARG2, ARG2, #offset
+        | ldr ARG3, [x21, #b_off]
+        | add ARG3, ARG3, #offset
+        | str RV, [x21, #c_off]
+        | add ARG4, RV, #offset
+        switch (op) {
+        case MVM_OP_sp_add_I:
+            | callp &MVM_bigint_fallback_add
+            break;
+        case MVM_OP_sp_sub_I:
+            | callp &MVM_bigint_fallback_sub
+            break;
+        case MVM_OP_sp_mul_I:
+            | callp &MVM_bigint_fallback_mul
+            break;
+        }
+        |3:
         break;
-    case MVM_OP_sp_bool_I:
-        MVM_oops(tc, "ARM64 JIT: sp_bool_I not yet implemented");
+    }
+    case MVM_OP_sp_bool_I: {
+        MVMint16 dst = ins->operands[0].reg.orig;
+        MVMint16 a   = ins->operands[1].reg.orig;
+        MVMint16 offset = ins->operands[2].lit_i16;
+        MVMint16 val_offset = offset + 4;
+        MVMint32 dst_off = WORK_OFF(dst), a_off = WORK_OFF(a);
+        | ldr TMP1, [x21, #a_off]
+        | ldr w10, [TMP1, #offset]
+        | cmn w10, #1
+        | bne >1
+        /* Smallint: test the 32-bit value for nonzero. */
+        | ldr w10, [TMP1, #val_offset]
+        | cmp w10, #0
+        | cset TMP3, ne
+        | str TMP3, [x21, #dst_off]
+        | b >2
+        |1:
+        /* Bigint: check mp_int->used (first field) for nonzero. */
+        | ldr TMP4, [TMP1, #offset]
+        | ldr w13, [TMP4]
+        | cmp w13, #0
+        | cset TMP3, ne
+        | str TMP3, [x21, #dst_off]
+        |2:
         break;
-    case MVM_OP_sp_boolify_iter_arr:
-        MVM_oops(tc, "ARM64 JIT: sp_boolify_iter_arr not yet implemented");
+    }
+    case MVM_OP_sp_boolify_iter_arr: {
+        MVMint16 dst = ins->operands[0].reg.orig;
+        MVMint16 obj = ins->operands[1].reg.orig;
+        MVMint32 dst_off = WORK_OFF(dst), obj_off = WORK_OFF(obj);
+        | ldr TMP1, [x21, #obj_off]
+        | ldr TMP2, MVMITER:TMP1->body.array_state.index
+        | add TMP2, TMP2, #1
+        | ldr TMP3, MVMITER:TMP1->body.array_state.limit
+        | cmp TMP2, TMP3
+        | cset TMP1, lt
+        | str TMP1, [x21, #dst_off]
         break;
+    }
     case MVM_OP_getcomp: {
         MVMint16 dst  = ins->operands[0].reg.orig;
         MVMint16 comp = ins->operands[1].reg.orig;
