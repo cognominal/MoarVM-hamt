@@ -2014,7 +2014,8 @@ void MVM_jit_emit_primitive(MVMThreadContext *tc, MVMJitCompiler *compiler,
             | cset RV, ne
             break;
         case MVM_OP_lt_I:
-            | cmp RV, #MP_LT
+            /* MP_LT is -1; the CMP immediate can't encode it, so use CMN. */
+            | cmn RV, #1
             | cset RV, eq
             break;
         case MVM_OP_le_I:
@@ -2026,7 +2027,8 @@ void MVM_jit_emit_primitive(MVMThreadContext *tc, MVMJitCompiler *compiler,
             | cset RV, eq
             break;
         case MVM_OP_ge_I:
-            | cmp RV, #MP_LT
+            /* MP_LT is -1; the CMP immediate can't encode it, so use CMN. */
+            | cmn RV, #1
             | cset RV, ne
             break;
         }

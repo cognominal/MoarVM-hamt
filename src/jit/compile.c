@@ -225,21 +225,28 @@ MVMJitCode * MVM_jit_compiler_assemble(MVMThreadContext *tc, MVMJitCompiler *cl,
 
     MVMint32 dasm_error = 0;
 
-   /* compile the function */
+   /* compile the function. With DASM_CHECKS enabled, dasm_link/dasm_encode
+    * fail on out-of-range immediates (DASM_S_RANGE_*); the frame then safely
+    * falls back to the interpreter. Set MVM_JIT_DEBUG=1 to see which frames
+    * fail and at which actionlist offset (low bits of the error code). */
     if ((dasm_error = dasm_link(cl, &codesize)) != 0) {
-        char *frame_name = MVM_string_utf8_encode_C_string(tc, jg->sg->sf->body.name);
-        fprintf(stderr, "DynASM could not link frame '%s', error: 0x%x\n",
-                frame_name, dasm_error);
-        MVM_free(frame_name);
+        if (tc->instance->jit_debug_enabled) {
+            char *frame_name = MVM_string_utf8_encode_C_string(tc, jg->sg->sf->body.name);
+            fprintf(stderr, "DynASM could not link frame '%s', error: 0x%x\n",
+                    frame_name, dasm_error);
+            MVM_free(frame_name);
+        }
         return NULL;
     }
 
     memory = MVM_platform_alloc_pages(codesize, MVM_PAGE_READ|MVM_PAGE_WRITE);
     if ((dasm_error = dasm_encode(cl, memory)) != 0) {
-        char *frame_name = MVM_string_utf8_encode_C_string(tc, jg->sg->sf->body.name);
-        fprintf(stderr, "DynASM could not encode frame '%s', error: 0x%x\n",
-                frame_name, dasm_error);
-        MVM_free(frame_name);
+        if (tc->instance->jit_debug_enabled) {
+            char *frame_name = MVM_string_utf8_encode_C_string(tc, jg->sg->sf->body.name);
+            fprintf(stderr, "DynASM could not encode frame '%s', error: 0x%x\n",
+                    frame_name, dasm_error);
+            MVM_free(frame_name);
+        }
         return NULL;
     }
 
