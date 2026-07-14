@@ -215,18 +215,26 @@ Outstanding: Blin (ecosystem tests), and verifying x64 is not regressed
 
 ## Milestone 8 — Tuning and PR (IN PROGRESS)
 
-Measured so far (Apple Silicon, CORE.setting compile):
+Measured so far (Apple Silicon, CORE.setting compile, 3 runs each):
 
-- Wall time 29s with JIT vs 36s with `MVM_JIT_DISABLE=1` (~19% faster).
+- Default (lego + expression JIT): 29s, 29s, 29s.
+- `MVM_JIT_EXPR_DISABLE=1` (lego only): 29s, 29s, 30s.
+- `MVM_JIT_DISABLE=1` (interpreter + spesh bytecode): 35s, 37s, 35s.
+
+So the JIT is worth ~20% on this workload; the expression JIT's
+contribution is currently negligible on it (within noise) — a future
+tuning target, not a blocker.
+
 - JIT coverage: 21 frame bails out of 9,046 specializations (99.8%);
   the bails are all rare startup meta-ops (`settypehll`, `getenvhash`,
   `freshcoderef`, …) — no high-value emitter is missing.
+- Rebased onto `main` (2026.06.1); clean rebase, full re-verification
+  (CORE build + Rakudo `make test`) green on the new base.
 
 Remaining:
 
-- Benchmark expression-JIT contribution (`MVM_JIT_EXPR_DISABLE=1` A/B).
 - Compare against x64 baselines; investigate anomalies.
-- Rebase onto `main`; clean commit history.
+- Blin ecosystem run.
 - Open GitHub Pull Request (notifies MoarVM team automatically).
 
 ---
