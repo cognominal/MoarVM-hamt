@@ -1,8 +1,11 @@
 # ARM64 JIT Port — Status and Roadmap
 
 This document tracks the ARM64 JIT port on the `arm-jit` branch.
-For background, porting risks, required knowledge, and alternate
-approaches see [`aarch64-jit-scope.md`](aarch64-jit-scope.md) (2021 draft scope).
+For the backend's design reference (register conventions, the
+`callp`/`callf` return-address protocol, AArch64 encoding gotchas, and
+debugging tooling) see [`arm64-design.md`](arm64-design.md). For
+background, porting risks, required knowledge, and alternate approaches
+see [`aarch64-jit-scope.md`](aarch64-jit-scope.md) (2021 draft scope).
 
 ---
 
@@ -45,7 +48,7 @@ approaches see [`aarch64-jit-scope.md`](aarch64-jit-scope.md) (2021 draft scope)
 
 ### Stack frame layout (prologue)
 
-80-byte frame; SP remains 16-byte aligned throughout.
+160-byte frame; SP remains 16-byte aligned throughout.
 
 ```
 [sp+0 ]  x29 (FP)
@@ -53,20 +56,19 @@ approaches see [`aarch64-jit-scope.md`](aarch64-jit-scope.md) (2021 draft scope)
 [sp+16]  x19 (TC saved)
 [sp+24]  x20 (CU saved)
 [sp+32]  x21 (WORK saved)
-[sp+40..79] available for spills
+[sp+40]  jit_return_address slot (see arm64-design.md)
+[sp+48..159] per-emitter scratch (spills, MVMArgs for dispatch)
 ```
 
-### `callp` macro
+### `callp` / `callf` macros
 
-ARM64 has no equivalent of x86's `call imm32` for arbitrary 64-bit addresses.
-`callp` stores the target pointer in the data section, loads it via a
-PC-relative `ldr`, then executes `blr`:
-
-```asm
-.data; 5: .quad (uintptr_t)(funcptr); .code
-ldr  x16, <5
-blr  x16
-```
+ARM64 has no equivalent of x86's `call imm32` for arbitrary 64-bit
+addresses, and `blr` does not push a return address anywhere in memory.
+`callp` loads the target from the data section PC-relatively and, like
+`callf` (target already in x16), maintains the `[sp,#40]`
+`jit_return_address` slot around the call — including the
+reload-and-branch on return that lets deopt redirect the frame. See
+[`arm64-design.md`](arm64-design.md) for the full protocol.
 
 ### Known workarounds
 
@@ -141,12 +143,15 @@ x64 slot-redirect approach doesn't apply, so we use a scratch copy instead:
   `ldp x29, x30, [sp], #80` restores the **original** saved LR from `[sp+8]`
   (not `[sp+40]`), so trampoline overwrites to `[sp+40]` don't cause loops.
 
-Limitation: `callp` does not update `[sp+40]` before each `blr`, so
-`*jit_return_address` remains the outer LR rather than a per-callp JIT
-position. This means `MVM_jit_code_get_current_position` may return an
-imprecise address when called from inside a C helper. Exception re-entry
-via JIT is therefore not yet precise — a known gap, deferred to a later
-milestone.
+~~Limitation: `callp` does not update `[sp+40]` before each `blr`~~ —
+**resolved**: `callp` (and the newer `callf`) now store the resume
+address into `[sp,#40]` before every call and reload-and-branch on
+return, so `MVM_jit_code_get_current_position` is precise from inside
+C helpers and deopt can redirect a frame that is mid-call. A stale slot
+here was one of the three bugs behind the "VMNull race"
+(see `arm64-vmnull-race-report.md`). The only remaining bare-`blr`
+sites are calls made while sp is temporarily adjusted for stack
+arguments, matching an equivalent x64 limitation.
 
 `no_trampoline = 1` removed from both test files. All 19 tests still pass.
 
@@ -185,38 +190,41 @@ All 19 tests (frame + call_c) still pass.
 
 ---
 
-## Milestone 6 — NQP integration test
+## Milestone 6 — NQP integration test (DONE)
 
-Build MoarVM with ARM64 JIT enabled, build NQP against it, run the NQP test
-suite:
-
-```bash
-perl Configure.pl --prefix=$(pwd)/../install
-make install
-cd ../nqp && perl Configure.pl --backends=moar --prefix=$(pwd)/../install
-make install
-prove -j2 -r -e ../install/bin/nqp t/nqp t/hll t/qregex t/moar t/serialization
-```
-
-Expect many `MVM_oops` panics initially as unimplemented emitters are
-hit. Track and fix them bottom-up.
+NQP self-hosts on the backend; the full suite passes:
+13,048 tests across t/nqp t/hll t/qregex t/moar t/serialization.
 
 ---
 
-## Milestone 7 — Rakudo and spectest
+## Milestone 7 — Rakudo and spectest (DONE)
 
-Once NQP tests pass cleanly:
+Rakudo builds (the CORE.setting compile is the heaviest JIT workload and
+was where the final round of miscompiles surfaced — see
+`arm64-vmnull-race-report.md`). Results:
 
-1. Build Rakudo against the ARM64 MoarVM.
-2. Run `prove -j2 -e ../install/bin/raku -vlr t`.
-3. Run Blin (ecosystem tests) on ARM64 — and verify that x64 is not
-   regressed (the `tile.c` fix is cross-arch).
+- `make test`: 216 files, 3,096 tests, PASS.
+- Full spectest: 1,372 files, 138,603 tests, PASS.
+- Spectest under `MVM_SPESH_NODELAY=1` (everything specialized and JIT'd
+  immediately): PASS.
+
+Outstanding: Blin (ecosystem tests), and verifying x64 is not regressed
+(the `tile.c` fix is cross-arch).
 
 ---
 
-## Milestone 8 — Tuning and PR
+## Milestone 8 — Tuning and PR (IN PROGRESS)
 
-- Benchmark: interpreter-only vs. lego-JIT vs. expression-JIT on ARM64.
+Measured so far (Apple Silicon, CORE.setting compile):
+
+- Wall time 29s with JIT vs 36s with `MVM_JIT_DISABLE=1` (~19% faster).
+- JIT coverage: 21 frame bails out of 9,046 specializations (99.8%);
+  the bails are all rare startup meta-ops (`settypehll`, `getenvhash`,
+  `freshcoderef`, …) — no high-value emitter is missing.
+
+Remaining:
+
+- Benchmark expression-JIT contribution (`MVM_JIT_EXPR_DISABLE=1` A/B).
 - Compare against x64 baselines; investigate anomalies.
 - Rebase onto `main`; clean commit history.
 - Open GitHub Pull Request (notifies MoarVM team automatically).
