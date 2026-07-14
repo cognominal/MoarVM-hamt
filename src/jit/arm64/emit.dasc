@@ -3486,13 +3486,20 @@ void MVM_jit_emit_runnativecall(MVMThreadContext *tc, MVMJitCompiler *compiler,
     /* Set up call arguments */
     MVMint32 nc_sp_adj = emit_arm64_callargs(tc, compiler, jg, runcode->args, runcode->num_args);
 
-    /* Call the native function */
+    /* Call the native function. A native callback may re-enter MoarVM and
+     * dispatch frames, so maintain the jit_return_address slot via callf —
+     * except when sp was adjusted for stack args, where [sp,#40] is not the
+     * trampoline slot (x64 has the same limitation there). */
     | .data
     | 5:
     | .quad (MVMuint64)(uintptr_t)(runcode->entry_point)
     | .code
     | ldr FUNCTION, <5
-    | blr FUNCTION
+    if (nc_sp_adj == 0) {
+        | callf
+    } else {
+        | blr FUNCTION
+    }
     if (nc_sp_adj > 0) {
         | add sp, sp, #nc_sp_adj
     }

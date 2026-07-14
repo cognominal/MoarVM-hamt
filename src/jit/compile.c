@@ -332,13 +332,20 @@ MVMJitCode* MVM_jit_code_copy(MVMThreadContext *tc, MVMJitCode * const code) {
 }
 
 void MVM_jit_code_destroy(MVMThreadContext *tc, MVMJitCode *code) {
-    /* fetch_and_sub1 returns previous value, so check if there's only 1 reference */
+    /* fetch_and_sub1 returns previous value, so check if there's only 1
+     * reference. The decrement must be a release (so this thread's last uses
+     * of the code happen-before the free in whichever thread drops the final
+     * reference), and the freeing thread must acquire before tearing down —
+     * relaxed ordering here is a real use-after-free hazard on weak-memory
+     * targets like AArch64, even though increments may stay relaxed. */
 #ifdef MVM_USE_C11_ATOMICS
-    if (atomic_fetch_sub_explicit(&code->ref_cnt, 1, memory_order_relaxed) > 1)
+    if (atomic_fetch_sub_explicit(&code->ref_cnt, 1, memory_order_release) > 1)
         return;
+    atomic_thread_fence(memory_order_acquire);
 #else
     if (AO_fetch_and_sub1(&code->ref_cnt) > 1)
         return;
+    AO_nop_full();
 #endif
     MVM_platform_free_pages(code->func_ptr, code->size);
     MVM_free(code->labels);
