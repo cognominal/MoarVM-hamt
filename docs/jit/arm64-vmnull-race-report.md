@@ -224,4 +224,8 @@ since RV == ARG1 == x0 on AArch64).
 - Full `CORE.setting` compile with default spesh/JIT settings: passes
   (repeatedly), where it previously failed every run.
 - The single-frame reproducers for all three bugs pass individually.
-- NQP test suites re-run clean after the fixes.
+- NQP test suites: 13,048 tests, all pass.
+- Full Rakudo build on this MoarVM, then `make test`: 3,096 tests, all pass
+  (after additionally fixing `lt_I`/`ge_I`'s unencodable `cmp #MP_LT`
+  immediate, caught by `DASM_CHECKS` under `MVM_SPESH_NODELAY`).
+- Full Raku spectest: 1,372 files, 138,603 tests, all pass.
