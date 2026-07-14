@@ -4209,6 +4209,43 @@ MVMJitGraph * MVM_jit_try_make_graph(MVMThreadContext *tc, MVMSpeshGraph *sg) {
         }
     }
 
+    /* Debug/bring-up aids, inert when unset, keyed on an FNV-1a hash of the
+     * frame name + cuuid so the same frames are affected every run regardless
+     * of spesh worker timing:
+     *   MVM_JIT_BISECT=K:lo-hi  skip JIT for frames whose hash mod K is in
+     *                           [lo, hi] (they fall back to spesh bytecode)
+     *   MVM_JIT_ONLY=K:lo-hi    skip JIT for every frame EXCEPT those
+     * MVM_JIT_BISECT_VERBOSE=1 prints each frame that is skipped/kept. */
+    {
+        const char *bisect = getenv("MVM_JIT_BISECT");
+        const char *only   = getenv("MVM_JIT_ONLY");
+        unsigned int k, lo, hi;
+        const char *spec = bisect ? bisect : only;
+        if (spec && sscanf(spec, "%u:%u-%u", &k, &lo, &hi) == 3 && k
+                && sg->sf && sg->sf->body.name) {
+            char *nm = MVM_string_utf8_encode_C_string(tc, sg->sf->body.name);
+            char *cuuid = sg->sf->body.cuuid
+                ? MVM_string_utf8_encode_C_string(tc, sg->sf->body.cuuid) : NULL;
+            MVMuint32 hash = 2166136261u;
+            const char *p;
+            int in_range, skip;
+            for (p = nm ? nm : ""; *p; p++)
+                hash = (hash ^ (MVMuint8)*p) * 16777619u;
+            for (p = cuuid ? cuuid : ""; *p; p++)
+                hash = (hash ^ (MVMuint8)*p) * 16777619u;
+            in_range = hash % k >= lo && hash % k <= hi;
+            skip = bisect ? in_range : !in_range;
+            if (getenv("MVM_JIT_BISECT_VERBOSE") && (bisect ? in_range : !skip))
+                fprintf(stderr, "JIT-BISECT %s [%u/%u] '%s' (cuuid %s)\n",
+                        skip ? "skip" : "keep", hash % k, k,
+                        nm ? nm : "?", cuuid ? cuuid : "?");
+            MVM_free(nm);
+            MVM_free(cuuid);
+            if (skip)
+                return NULL;
+        }
+    }
+
     MVM_spesh_iterator_init(tc, &iter, sg);
     /* ignore first BB, which always contains a NOP */
     MVM_spesh_iterator_next_bb(tc, &iter);

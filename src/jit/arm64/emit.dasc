@@ -97,6 +97,22 @@
 |9:
 |.endmacro
 
+/* Call a C function whose address is in FUNCTION (x16), maintaining the
+ * jit_return_address slot at [sp,#40] exactly like callp: the callee (or
+ * anything it triggers — dispatch recording, GC, deopt, frame walks) can read
+ * the current JIT position from *tc->jit_return_address, and a deopt may
+ * REWRITE the slot to redirect us; hence the reload-and-branch on return.
+ * A bare `blr FUNCTION` loses both properties (BLR only sets LR on AArch64,
+ * unlike x64 CALL which pushes the return address where the walker finds it). */
+|.macro callf
+| adr x17, >9
+| str x17, [sp, #40]
+| blr FUNCTION
+| ldr x17, [sp, #40]
+| br x17
+|9:
+|.endmacro
+
 /* GC safe-point: if gc_status != 0, call into the GC. */
 |.macro gc_sync_point
 | ldr TMP1, TC->gc_status
@@ -194,7 +210,7 @@
 /* x-register numbers for the register aliases, for use with Rx(). */
 enum { ARM64_REG_ARG2 = 1, ARM64_REG_ARG3 = 2, ARM64_REG_ARG4 = 3,
        ARM64_REG_ARG5 = 4, ARM64_REG_TMP1 = 9, ARM64_REG_TMP2 = 10,
-       ARM64_REG_TMP6 = 14 };
+       ARM64_REG_TMP3 = 11, ARM64_REG_TMP5 = 13, ARM64_REG_TMP6 = 14 };
 
 /* Emit `add Rx(dst), x21, #off`, the address of a work register.  The ADD
  * immediate is only 12 bits (<= 4095); work offsets in large frames can
@@ -224,6 +240,31 @@ static void arm64_add_off(MVMThreadContext *tc, MVMJitCompiler *compiler,
             | movk Rx(scratch), #((off >> 16) & 0xffff), lsl #16
         }
         | add Rx(reg), Rx(reg), Rx(scratch)
+    }
+}
+
+/* Emit `ldr Rx(dst), [Rx(base), #off]` / `str Rx(src), [Rx(base), #off]`,
+ * materializing offsets beyond the 32760 scaled-immediate limit through x17
+ * (dead outside the callp blr window). Offsets must be 8-byte aligned. */
+static void arm64_ldr_off(MVMThreadContext *tc, MVMJitCompiler *compiler,
+                          int dst, int base, MVMint32 off) {
+    if ((MVMuint32)off <= 32760) {
+        | ldr Rx(dst), [Rx(base), #off]
+    } else {
+        | movz x17, #(off & 0xffff)
+        | movk x17, #((off >> 16) & 0xffff), lsl #16
+        | ldr Rx(dst), [Rx(base), x17]
+    }
+}
+
+static void arm64_str_off(MVMThreadContext *tc, MVMJitCompiler *compiler,
+                          int src, int base, MVMint32 off) {
+    if ((MVMuint32)off <= 32760) {
+        | str Rx(src), [Rx(base), #off]
+    } else {
+        | movz x17, #(off & 0xffff)
+        | movk x17, #((off >> 16) & 0xffff), lsl #16
+        | str Rx(src), [Rx(base), x17]
     }
 }
 
@@ -820,10 +861,8 @@ void MVM_jit_emit_primitive(MVMThreadContext *tc, MVMJitCompiler *compiler,
         /* NB: the DynASM form `FRAME:TMP1->env` silently emits no
          * instruction here, so load env via an explicit offsetof. */
         | ldr TMP5, [TMP6, #offsetof(MVMFrame, env)]
-        {
-            MVMint32 env_off = idx * (MVMint32)sizeof(MVMRegister);
-            | ldr TMP5, [TMP5, #env_off]
-        }
+        arm64_ldr_off(tc, compiler, ARM64_REG_TMP5, ARM64_REG_TMP5,
+                      idx * (MVMint32)sizeof(MVMRegister));
         lexical_types = (!out && jg->sg->lexical_types ?
                          jg->sg->lexical_types :
                          sf->body.lexical_types);
@@ -855,10 +894,8 @@ void MVM_jit_emit_primitive(MVMThreadContext *tc, MVMJitCompiler *compiler,
         /* NB: the DynASM form `FRAME:TMP6->env` silently emits no
          * instruction here, so load env via an explicit offsetof. */
         | ldr TMP5, [TMP6, #offsetof(MVMFrame, env)]
-        {
-            MVMint32 env_off = idx * (MVMint32)sizeof(MVMRegister);
-            | ldr TMP5, [TMP5, #env_off]
-        }
+        arm64_ldr_off(tc, compiler, ARM64_REG_TMP5, ARM64_REG_TMP5,
+                      idx * (MVMint32)sizeof(MVMRegister));
         if (op == MVM_OP_sp_getlexvia_o) {
             | cbnz TMP5, >1
             | mov ARG1, x19
@@ -889,7 +926,7 @@ void MVM_jit_emit_primitive(MVMThreadContext *tc, MVMJitCompiler *compiler,
          * instruction here, so load env via an explicit offsetof. */
         | ldr TMP2, [TMP1, #offsetof(MVMFrame, env)]
         | ldr TMP3, [x21, #src_off]
-        | str TMP3, [TMP2, #env_off]
+        arm64_str_off(tc, compiler, ARM64_REG_TMP3, ARM64_REG_TMP2, env_off);
         if (op == MVM_OP_sp_bindlexvia_os) {
             | check_wb TMP1, TMP3, >2
             | hit_wb TMP1, TMP3
@@ -1002,7 +1039,7 @@ void MVM_jit_emit_primitive(MVMThreadContext *tc, MVMJitCompiler *compiler,
          * instruction here, so load env via an explicit offsetof. */
         | ldr TMP2, [TMP1, #offsetof(MVMFrame, env)]
         | ldr TMP3, [x21, #src_off]
-        | str TMP3, [TMP2, #env_off]
+        arm64_str_off(tc, compiler, ARM64_REG_TMP3, ARM64_REG_TMP2, env_off);
         if (lexical_types[idx] == MVM_reg_obj || lexical_types[idx] == MVM_reg_str) {
             | check_wb TMP1, TMP3, >2
             | hit_wb TMP1, TMP3
@@ -1375,7 +1412,9 @@ void MVM_jit_emit_primitive(MVMThreadContext *tc, MVMJitCompiler *compiler,
         MVMint32 dst_off = WORK_OFF(dst);
         MVMint32 idx_off = (MVMint32)(idx * sizeof(MVMObject*));
         | ldr TMP1, CU->body.coderefs
-        | ldr TMP1, [TMP1, #idx_off]
+        /* Rakudo-scale compunits have > 4095 coderefs, past the scaled-LDR
+         * immediate limit. */
+        arm64_ldr_off(tc, compiler, ARM64_REG_TMP1, ARM64_REG_TMP1, idx_off);
         | str TMP1, [x21, #dst_off]
         break;
     }
@@ -2040,7 +2079,7 @@ void MVM_jit_emit_primitive(MVMThreadContext *tc, MVMJitCompiler *compiler,
         | ldr ARG2, OBJECT:TMP6->st
         | ldr FUNCTION, STABLE:ARG2->REPR
         | ldr FUNCTION, REPR:FUNCTION->get_storage_spec
-        | blr FUNCTION
+        | callf
         | ldrh w14, STORAGESPEC:RV->boxed_primitive
         |1:
         | str TMP6, [x21, #dst_off]
@@ -2057,7 +2096,7 @@ void MVM_jit_emit_primitive(MVMThreadContext *tc, MVMJitCompiler *compiler,
         | ldr FUNCTION, STABLE:ARG2->REPR
         | ldr FUNCTION, REPR:FUNCTION->get_storage_spec
         | mov ARG1, x19
-        | blr FUNCTION
+        | callf
         | ldrh w14, STORAGESPEC:RV->boxed_primitive
         | cbz TMP6, >1
         | ldrh w14, STORAGESPEC:RV->bits
@@ -2076,7 +2115,7 @@ void MVM_jit_emit_primitive(MVMThreadContext *tc, MVMJitCompiler *compiler,
         | ldr ARG2, OBJECT:TMP5->st
         | ldr FUNCTION, STABLE:ARG2->REPR
         | ldr FUNCTION, REPR:FUNCTION->get_storage_spec
-        | blr FUNCTION
+        | callf
         | ldrh w14, STORAGESPEC:RV->boxed_primitive
         | cbz TMP6, >1
         | ldrb w14, STORAGESPEC:RV->is_unsigned
@@ -2140,7 +2179,7 @@ void MVM_jit_emit_primitive(MVMThreadContext *tc, MVMJitCompiler *compiler,
         | mov ARG2, TMP5
         arm64_lea_work(tc, compiler, ARM64_REG_ARG3, dst_off);
         | ldr FUNCTION, CONTAINERSPEC:TMP6->fetch
-        | blr FUNCTION
+        | callf
         | b >2
         |1:
         | str TMP5, [x21, #dst_off]
@@ -2157,6 +2196,9 @@ void MVM_jit_emit_primitive(MVMThreadContext *tc, MVMJitCompiler *compiler,
         | ldr TMP1, OBJECT:TMP1->st
         | ldr TMP1, STABLE:TMP1->container_spec
         |1:
+        /* cset reads NZCV; ldr/cbz set no flags, so compare explicitly (both
+         * paths land here: TMP1 is 0 for null/no-spec, the spec otherwise). */
+        | cmp TMP1, #0
         | cset TMP1, ne
         | str TMP1, [x21, #dst_off]
         break;
@@ -2270,7 +2312,7 @@ void MVM_jit_emit_primitive(MVMThreadContext *tc, MVMJitCompiler *compiler,
         } else {
             | ldr FUNCTION, CONTAINERSPEC:FUNCTION->store_unchecked
         }
-        | blr FUNCTION
+        | callf
         break;
     }
     case MVM_OP_sp_getlexstatic_o: {
@@ -2290,7 +2332,7 @@ void MVM_jit_emit_primitive(MVMThreadContext *tc, MVMJitCompiler *compiler,
         | ldr ARG3, [x21, #name_off]
         | ldr FUNCTION, [ARG2]
         | ldr FUNCTION, MVMDISPINLINECACHEENTRY:FUNCTION->run_getlexstatic
-        | blr FUNCTION
+        | callf
         | str RV, [x21, #dst_off]
         break;
     }
@@ -2571,7 +2613,7 @@ void MVM_jit_emit_primitive(MVMThreadContext *tc, MVMJitCompiler *compiler,
         | ldr FUNCTION, OBJECT:ARG2->st
         | ldr FUNCTION, STABLE:FUNCTION->container_spec
         | ldr FUNCTION, CONTAINERSPEC:FUNCTION->cas
-        | blr FUNCTION
+        | callf
         break;
     }
     case MVM_OP_sp_atomicload_o: {
@@ -2584,7 +2626,7 @@ void MVM_jit_emit_primitive(MVMThreadContext *tc, MVMJitCompiler *compiler,
         | ldr FUNCTION, OBJECT:ARG2->st
         | ldr FUNCTION, STABLE:FUNCTION->container_spec
         | ldr FUNCTION, CONTAINERSPEC:FUNCTION->load_atomic
-        | blr FUNCTION
+        | callf
         | str RV, [x21, #result_off]
         break;
     }
@@ -2599,7 +2641,7 @@ void MVM_jit_emit_primitive(MVMThreadContext *tc, MVMJitCompiler *compiler,
         | ldr FUNCTION, OBJECT:ARG2->st
         | ldr FUNCTION, STABLE:FUNCTION->container_spec
         | ldr FUNCTION, CONTAINERSPEC:FUNCTION->store_atomic
-        | blr FUNCTION
+        | callf
         break;
     }
     case MVM_OP_hllbool: {
@@ -2647,7 +2689,7 @@ void MVM_jit_emit_primitive(MVMThreadContext *tc, MVMJitCompiler *compiler,
         | ldr FUNCTION, REPR:RV->type_object_for
         | mov ARG1, x19
         | ldr ARG2, [x21, #how_off]
-        | blr FUNCTION
+        | callf
         | str RV, [x21, #dst_off]
         break;
     }
@@ -2664,7 +2706,7 @@ void MVM_jit_emit_primitive(MVMThreadContext *tc, MVMJitCompiler *compiler,
         | ldr FUNCTION, REPR:RV->type_object_for
         | mov ARG1, x19
         | ldr ARG2, [x21, #how_off]
-        | blr FUNCTION
+        | callf
         | ldr TMP1, OBJECT:RV->st
         | mov w10, #1
         | str w10, STABLE:TMP1->is_mixin_type
@@ -2685,7 +2727,7 @@ void MVM_jit_emit_primitive(MVMThreadContext *tc, MVMJitCompiler *compiler,
         | mov ARG1, x19
         | get_stable ARG2, TMP6
         | ldr ARG3, [x21, #type_off]
-        | blr FUNCTION
+        | callf
         | ldr TMP1, [x21, #obj_off]
         | str TMP1, [x21, #dst_off]
         break;
@@ -2810,16 +2852,20 @@ void MVM_jit_emit_primitive(MVMThreadContext *tc, MVMJitCompiler *compiler,
         | b >3
         |1:
         /* Slow path: allocate the result, then call the bigint fallback.
+         * Read a and b BEFORE storing the result to c: spesh may assign the
+         * result the same work register as an operand (c == a or c == b),
+         * and storing first would feed the fresh, empty bigint into the
+         * fallback (u.bigint == NULL -> crash in mp_add/sub/mul).
          * NB: RV and ARG1 are both x0, so consume RV (store result, compute
          * ARG4 = RV+offset) BEFORE loading tc into ARG1. */
         arm64_emit_fastcreate(tc, compiler, jg, ins);
-        | str RV, [x21, #c_off]
-        | add ARG4, RV, #offset
-        | mov ARG1, x19
         | ldr ARG2, [x21, #a_off]
         | add ARG2, ARG2, #offset
         | ldr ARG3, [x21, #b_off]
         | add ARG3, ARG3, #offset
+        | str RV, [x21, #c_off]
+        | add ARG4, RV, #offset
+        | mov ARG1, x19
         switch (op) {
         case MVM_OP_sp_add_I:
             | callp &MVM_bigint_fallback_add
@@ -3098,7 +3144,7 @@ void MVM_jit_emit_guard(MVMThreadContext *tc, MVMJitCompiler *compiler,
         | mov ARG1, x19
         | mov ARG2, TMP1
         | ldr ARG3, [x21, #new_type_off]
-        | blr FUNCTION
+        | callf
         /* change_type may move the object; reload from WORK and store to dst */
         | ldr ARG2, [x21, #obj_off]
         | str ARG2, [x21, #dst_off]

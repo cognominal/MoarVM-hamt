@@ -227,15 +227,19 @@ MVMJitCode * MVM_jit_compiler_assemble(MVMThreadContext *tc, MVMJitCompiler *cl,
 
    /* compile the function */
     if ((dasm_error = dasm_link(cl, &codesize)) != 0) {
-        if (tc->instance->jit_debug_enabled)
-            fprintf(stderr, "DynASM could not link, error: %d\n", dasm_error);
+        char *frame_name = MVM_string_utf8_encode_C_string(tc, jg->sg->sf->body.name);
+        fprintf(stderr, "DynASM could not link frame '%s', error: 0x%x\n",
+                frame_name, dasm_error);
+        MVM_free(frame_name);
         return NULL;
     }
 
     memory = MVM_platform_alloc_pages(codesize, MVM_PAGE_READ|MVM_PAGE_WRITE);
     if ((dasm_error = dasm_encode(cl, memory)) != 0) {
-        if (tc->instance->jit_debug_enabled)
-            fprintf(stderr, "DynASM could not encode, error: %d\n", dasm_error);
+        char *frame_name = MVM_string_utf8_encode_C_string(tc, jg->sg->sf->body.name);
+        fprintf(stderr, "DynASM could not encode frame '%s', error: 0x%x\n",
+                frame_name, dasm_error);
+        MVM_free(frame_name);
         return NULL;
     }
 

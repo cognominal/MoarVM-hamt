@@ -6,6 +6,12 @@
 #define Dst_DECL MVMJitCompiler *compiler
 #define Dst_REF (compiler->dasm_handle)
 #define Dst (compiler)
+/* Enable DynASM's immediate/relocation range checking. Without this an
+ * out-of-range immediate (e.g. a scaled load/store offset beyond 32760 on
+ * AArch64, as produced by very large frames) is silently truncated into a
+ * wrong-but-valid instruction; with it, dasm_link/dasm_encode return
+ * DASM_S_RANGE_* and the frame falls back to the interpreter. */
+#define DASM_CHECKS 1
 #include "dasm_proto.h"
 
 #define MVM_JIT_MAX_GLOBALS 1
