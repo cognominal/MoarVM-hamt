@@ -246,6 +246,7 @@ typedef struct MVMDecodeStreamSeparators MVMDecodeStreamSeparators;
 typedef struct MVMNativeCallback MVMNativeCallback;
 typedef struct MVMNativeCallbackCacheHead MVMNativeCallbackCacheHead;
 typedef struct MVMJitGraph MVMJitGraph;
+typedef struct MVMJitExprStats MVMJitExprStats;
 typedef struct MVMJitNode MVMJitNode;
 typedef struct MVMJitDeopt MVMJitDeopt;
 typedef struct MVMJitInline MVMJitInline;

@@ -687,7 +687,7 @@ MVMJitExprTree * MVM_jit_expr_tree_build(MVMThreadContext *tc, MVMJitGraph *jg, 
     values = MVM_malloc(sizeof(struct ValueDefinition)*sg->num_locals);
     memset(values, -1, sizeof(struct ValueDefinition)*sg->num_locals);
 
-#define BAIL(x, ...) do { if (x) { MVM_spesh_graph_add_comment(tc, iter->graph, iter->ins, "expr bail: " __VA_ARGS__); goto done; } } while (0)
+#define BAIL(x, ...) do { if (x) { MVM_spesh_graph_add_comment(tc, iter->graph, iter->ins, "expr bail: " __VA_ARGS__); MVM_jit_expr_stats_bail(tc, iter->ins); goto done; } } while (0)
 
 
     /* Generate a tree based on templates. The basic idea is to keep a
@@ -897,6 +897,9 @@ MVMJitExprTree * MVM_jit_expr_tree_build(MVMThreadContext *tc, MVMJitGraph *jg, 
         if (after_label >= 0 && MVM_jit_label_is_for_ins(tc, jg, after_label)) {
             MVM_VECTOR_PUSH(tree->roots, MVM_jit_expr_add_label(tc, tree, after_label));
         }
+
+        if (tc->instance->jit_expr_stats)
+            tc->instance->jit_expr_stats->ins_expr++;
     }
 
  done:

@@ -342,6 +342,20 @@ MVMInstance * MVM_vm_create_instance(void) {
             instance->jit_debug_enabled = 1;
     }
 
+    {
+        /* MVM_JIT_EXPR_STATS=1 dumps expression-JIT coverage counters to
+         * stderr at exit; any other value is used as an output filename. */
+        char *expr_stats = getenv("MVM_JIT_EXPR_STATS");
+        if (expr_stats && expr_stats[0]) {
+            instance->jit_expr_stats = MVM_calloc(1, sizeof(MVMJitExprStats));
+            if (strcmp(expr_stats, "1") != 0 && strcmp(expr_stats, "-") != 0) {
+                size_t len = strlen(expr_stats) + 1;
+                instance->jit_expr_stats_file = MVM_malloc(len);
+                memcpy(instance->jit_expr_stats_file, expr_stats, len);
+            }
+        }
+    }
+
 #if linux
     {
         char *jit_perf_map = getenv("MVM_JIT_PERF_MAP");
@@ -634,6 +648,15 @@ void MVM_vm_exit(MVMInstance *instance) {
         MVM_spesh_worker_join(instance->main_thread);
         fclose(instance->spesh_log_fh);
     }
+    if (instance->jit_expr_stats) {
+        /* Counters are written by the spesh worker; join it (if the spesh
+         * log above didn't already) so the final read is quiescent. */
+        if (!instance->spesh_log_fh) {
+            MVM_spesh_worker_stop(instance->main_thread);
+            MVM_spesh_worker_join(instance->main_thread);
+        }
+        MVM_jit_expr_stats_dump_and_free(instance);
+    }
     if (instance->dynvar_log_fh) {
         fprintf(instance->dynvar_log_fh, "- x 0 0 0 0 %"PRId64" %"PRIu64" %"PRIu64"\n", instance->dynvar_log_lasttime, uv_hrtime(), uv_hrtime());
         fclose(instance->dynvar_log_fh);
@@ -667,6 +690,9 @@ void MVM_vm_destroy_instance(MVMInstance *instance) {
     MVM_spesh_worker_stop(instance->main_thread);
     MVM_spesh_worker_join(instance->main_thread);
     MVM_io_eventloop_destroy(instance->main_thread);
+
+    if (instance->jit_expr_stats)
+        MVM_jit_expr_stats_dump_and_free(instance);
 
     /* Run the normal GC one more time to actually collect the spesh thread */
     MVM_gc_enter_from_allocator(instance->main_thread);

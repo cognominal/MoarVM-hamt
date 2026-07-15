@@ -1,3 +1,30 @@
+/* Expression-JIT coverage statistics, collected when the environment
+ * variable MVM_JIT_EXPR_STATS is set (see MVMInstance.jit_expr_stats).
+ * All JIT compilation happens on the (single) spesh worker thread, so
+ * plain counters suffice; they are dumped after the worker is joined. */
+struct MVMJitExprStats {
+    /* basic blocks seen by the JIT graph builder / with >= 1 expr tree */
+    MVMuint64 bbs_total;
+    MVMuint64 bbs_with_tree;
+    /* trees built; total tree nodes; total roots (~ ops lowered per tree) */
+    MVMuint64 trees;
+    MVMuint64 tree_nodes;
+    MVMuint64 tree_roots;
+    /* spesh instructions consumed into trees vs by the lego backend */
+    MVMuint64 ins_expr;
+    MVMuint64 ins_lego;
+    /* histogram of tree sizes in roots: 1,2,3,4,5-8,9-16,17-32,33-64,65+ */
+    MVMuint64 roots_hist[9];
+    /* tree-build bails on an extop (not representable below) */
+    MVMuint64 bail_extop;
+    /* per-opcode tree-build bail counts (template misses and other
+     * op-keyed bails), indexed by core opcode */
+    MVMuint32 bail_op[1024]; /* MVM_OP_EXT_BASE */
+};
+
+void MVM_jit_expr_stats_bail(MVMThreadContext *tc, MVMSpeshIns *ins);
+void MVM_jit_expr_stats_dump_and_free(MVMInstance *instance);
+
 /* The MVMJitGraph is - for now - really a linked list of instructions.
  * It's likely I'll add complexity when it's needed */
 struct MVMJitGraph {

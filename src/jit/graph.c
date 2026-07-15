@@ -4132,9 +4132,91 @@ static MVMint32 consume_ins(MVMThreadContext *tc, MVMJitGraph *jg,
     return 1;
 }
 
+/* Expression-JIT coverage statistics (MVM_JIT_EXPR_STATS). The counters live
+ * on the instance and are only written from the spesh worker thread; they are
+ * dumped after that thread is joined at VM teardown. */
+void MVM_jit_expr_stats_bail(MVMThreadContext *tc, MVMSpeshIns *ins) {
+    MVMJitExprStats *stats = tc->instance->jit_expr_stats;
+    if (!stats || !ins)
+        return;
+    if (ins->info->opcode < MVM_OP_EXT_BASE)
+        stats->bail_op[ins->info->opcode]++;
+    else
+        stats->bail_extop++;
+}
+
+void MVM_jit_expr_stats_dump_and_free(MVMInstance *instance) {
+    MVMJitExprStats *stats = instance->jit_expr_stats;
+    FILE *out = stderr;
+    MVMuint64 bails_total = stats->bail_extop;
+    MVMuint64 ins_total;
+    MVMuint32 i;
+    static const char * const hist_label[9] = {
+        "1", "2", "3", "4", "5-8", "9-16", "17-32", "33-64", "65+" };
+
+    if (instance->jit_expr_stats_file) {
+        out = fopen(instance->jit_expr_stats_file, "w");
+        if (!out)
+            out = stderr;
+    }
+
+    ins_total = stats->ins_expr + stats->ins_lego;
+    fprintf(out, "Expression JIT coverage statistics\n");
+    fprintf(out, "==================================\n");
+    fprintf(out, "expression JIT enabled:  %s\n",
+            instance->jit_expr_enabled ? "yes" : "NO");
+    fprintf(out, "basic blocks seen:       %" PRIu64 "\n", stats->bbs_total);
+    fprintf(out, "  with an expr tree:     %" PRIu64 " (%.1f%%)\n",
+            stats->bbs_with_tree,
+            stats->bbs_total ? 100.0 * stats->bbs_with_tree / stats->bbs_total : 0.0);
+    fprintf(out, "instructions total:      %" PRIu64 "\n", ins_total);
+    fprintf(out, "  lowered via expr tree: %" PRIu64 " (%.1f%%)\n", stats->ins_expr,
+            ins_total ? 100.0 * stats->ins_expr / ins_total : 0.0);
+    fprintf(out, "  lowered via lego:      %" PRIu64 "\n", stats->ins_lego);
+    fprintf(out, "trees built:             %" PRIu64 "\n", stats->trees);
+    if (stats->trees) {
+        fprintf(out, "  mean roots/tree:       %.2f\n",
+                (double)stats->tree_roots / stats->trees);
+        fprintf(out, "  mean nodes/tree:       %.2f\n",
+                (double)stats->tree_nodes / stats->trees);
+        fprintf(out, "  tree size histogram (roots):\n");
+        for (i = 0; i < 9; i++)
+            fprintf(out, "    %-6s %" PRIu64 "\n", hist_label[i], stats->roots_hist[i]);
+    }
+
+    for (i = 0; i < MVM_OP_EXT_BASE; i++)
+        bails_total += stats->bail_op[i];
+    fprintf(out, "tree-build bails:        %" PRIu64 " (extops: %" PRIu64 ")\n",
+            bails_total, stats->bail_extop);
+    fprintf(out, "  tree-terminating ops, by frequency:\n");
+    for (;;) {
+        MVMuint32 best = 0, best_op = 0;
+        for (i = 0; i < MVM_OP_EXT_BASE; i++) {
+            if (stats->bail_op[i] > best) {
+                best = stats->bail_op[i];
+                best_op = i;
+            }
+        }
+        if (!best)
+            break;
+        fprintf(out, "    %8u  %s\n", best,
+                MVM_op_get_op(best_op) ? MVM_op_get_op(best_op)->name : "?");
+        stats->bail_op[best_op] = 0;
+    }
+
+    if (out != stderr)
+        fclose(out);
+    MVM_free(instance->jit_expr_stats_file);
+    instance->jit_expr_stats_file = NULL;
+    MVM_free(stats);
+    instance->jit_expr_stats = NULL;
+}
+
 static MVMint32 consume_bb(MVMThreadContext *tc, MVMJitGraph *jg,
                            MVMSpeshIterator *iter, MVMSpeshBB *bb) {
     MVMJitExprTree *tree = NULL;
+    MVMJitExprStats *stats = tc->instance->jit_expr_stats;
+    MVMint32 bb_has_tree = 0;
     MVMuint32 i;
     MVMint32 label = MVM_jit_label_before_bb(tc, jg, bb);
     jg_append_label(tc, jg, label);
@@ -4165,12 +4247,30 @@ static MVMint32 consume_bb(MVMThreadContext *tc, MVMJitGraph *jg,
                 node->u.tree     = tree;
                 tree->seq_nr     = jg->expr_seq_nr++;
                 jg_append_node(jg, node);
+                if (stats) {
+                    MVMuint32 roots = tree->roots_num;
+                    MVMuint32 bucket = roots <= 4 ? roots - 1
+                                     : roots <= 8 ? 4
+                                     : roots <= 16 ? 5
+                                     : roots <= 32 ? 6
+                                     : roots <= 64 ? 7 : 8;
+                    stats->trees++;
+                    stats->tree_nodes += tree->nodes_num;
+                    stats->tree_roots += roots;
+                    stats->roots_hist[bucket]++;
+                    bb_has_tree = 1;
+                }
             }
             if (iter->ins) {
                 /* something we can't compile yet, or simply an empty tree */
                 break;
             }
         }
+    }
+    if (stats) {
+        stats->bbs_total++;
+        if (bb_has_tree)
+            stats->bbs_with_tree++;
     }
 
     /* Try to consume the (rest of the) basic block per instruction */
@@ -4179,6 +4279,8 @@ static MVMint32 consume_bb(MVMThreadContext *tc, MVMJitGraph *jg,
         if(!consume_ins(tc, jg, iter, iter->ins))
             return 0;
         after_ins(tc, jg, iter, iter->ins);
+        if (stats)
+            stats->ins_lego++;
         MVM_spesh_iterator_next_ins(tc, iter);
     }
 

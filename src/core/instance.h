@@ -359,6 +359,12 @@ struct MVMInstance {
     /* Directory name for JIT bytecode dumps */
     char *jit_bytecode_dir;
 
+    /* Expression-JIT coverage counters (MVM_JIT_EXPR_STATS); NULL unless
+     * enabled. Owned here; dumped and freed at VM teardown. */
+    MVMJitExprStats *jit_expr_stats;
+    /* Where to dump them ("-" or empty means stderr) */
+    char *jit_expr_stats_file;
+
     /* sequence number for JIT compiled frames */
     MVMint32 jit_seq_nr;
 
