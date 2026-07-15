@@ -4250,6 +4250,7 @@ static MVMint32 consume_bb(MVMThreadContext *tc, MVMJitGraph *jg,
 
     /* Try to create an expression tree */
     if (tc->instance->jit_expr_enabled && jg->expr_allowed &&
+        iter->bb->idx >= jg->expr_bb_lo && iter->bb->idx <= jg->expr_bb_hi &&
         (tc->instance->jit_expr_last_frame < 0 ||
          tc->instance->spesh_produced < tc->instance->jit_expr_last_frame ||
          (tc->instance->spesh_produced == tc->instance->jit_expr_last_frame &&
@@ -4372,16 +4373,26 @@ MVMJitGraph * MVM_jit_try_make_graph(MVMThreadContext *tc, MVMSpeshGraph *sg) {
     graph->first_node = NULL;
     graph->last_node  = NULL;
 
-    /* MVM_JIT_EXPR_ONLY=K:lo-hi restricts expression-tree building to frames
-     * whose ident hash mod K falls in [lo, hi]; other frames compile
-     * lego-only. Bisection aid for expression-JIT miscompiles. */
+    /* MVM_JIT_EXPR_ONLY=K:lo-hi[:bblo-bbhi] restricts expression-tree
+     * building to frames whose ident hash mod K falls in [lo, hi] (and,
+     * optionally, to basic blocks with idx in [bblo, bbhi] within them);
+     * everything else compiles lego-only. Bisection aid for expression-JIT
+     * miscompiles. */
     graph->expr_allowed = 1;
+    graph->expr_bb_lo   = 0;
+    graph->expr_bb_hi   = 0x7fffffff;
     {
         const char *expr_only = getenv("MVM_JIT_EXPR_ONLY");
-        unsigned int k, lo, hi;
-        if (expr_only && sscanf(expr_only, "%u:%u-%u", &k, &lo, &hi) == 3 && k) {
+        unsigned int k, lo, hi, bblo, bbhi;
+        int fields;
+        if (expr_only && (fields = sscanf(expr_only, "%u:%u-%u:%u-%u",
+                &k, &lo, &hi, &bblo, &bbhi)) >= 3 && k) {
             MVMuint32 hash = frame_ident_hash(tc, sg);
             graph->expr_allowed = hash % k >= lo && hash % k <= hi;
+            if (fields == 5 && graph->expr_allowed) {
+                graph->expr_bb_lo = bblo;
+                graph->expr_bb_hi = bbhi;
+            }
         }
     }
 
