@@ -40,6 +40,10 @@ struct MVMJitGraph {
     /* Sequence number for expr trees */
     MVMuint16      expr_seq_nr;
 
+    /* Whether expression-tree building is allowed for this frame (used by
+     * the MVM_JIT_EXPR_ONLY bisection aid; 1 unless restricted) */
+    MVMuint8       expr_allowed;
+
     /* resultant JIT code is supports 'invokish' etc? */
     MVMuint8       no_trampoline;
 

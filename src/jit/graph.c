@@ -4132,6 +4132,24 @@ static MVMint32 consume_ins(MVMThreadContext *tc, MVMJitGraph *jg,
     return 1;
 }
 
+/* FNV-1a hash of frame name + cuuid, used by the bisection aids so that the
+ * same frames are affected every run regardless of spesh worker timing. */
+static MVMuint32 frame_ident_hash(MVMThreadContext *tc, MVMSpeshGraph *sg) {
+    MVMuint32 hash = 2166136261u;
+    char *nm = sg->sf && sg->sf->body.name
+        ? MVM_string_utf8_encode_C_string(tc, sg->sf->body.name) : NULL;
+    char *cuuid = sg->sf && sg->sf->body.cuuid
+        ? MVM_string_utf8_encode_C_string(tc, sg->sf->body.cuuid) : NULL;
+    const char *p;
+    for (p = nm ? nm : ""; *p; p++)
+        hash = (hash ^ (MVMuint8)*p) * 16777619u;
+    for (p = cuuid ? cuuid : ""; *p; p++)
+        hash = (hash ^ (MVMuint8)*p) * 16777619u;
+    MVM_free(nm);
+    MVM_free(cuuid);
+    return hash;
+}
+
 /* Expression-JIT coverage statistics (MVM_JIT_EXPR_STATS). The counters live
  * on the instance and are only written from the spesh worker thread; they are
  * dumped after that thread is joined at VM teardown. */
@@ -4231,7 +4249,7 @@ static MVMint32 consume_bb(MVMThreadContext *tc, MVMJitGraph *jg,
     }
 
     /* Try to create an expression tree */
-    if (tc->instance->jit_expr_enabled &&
+    if (tc->instance->jit_expr_enabled && jg->expr_allowed &&
         (tc->instance->jit_expr_last_frame < 0 ||
          tc->instance->spesh_produced < tc->instance->jit_expr_last_frame ||
          (tc->instance->spesh_produced == tc->instance->jit_expr_last_frame &&
@@ -4314,35 +4332,32 @@ MVMJitGraph * MVM_jit_try_make_graph(MVMThreadContext *tc, MVMSpeshGraph *sg) {
     /* Debug/bring-up aids, inert when unset, keyed on an FNV-1a hash of the
      * frame name + cuuid so the same frames are affected every run regardless
      * of spesh worker timing:
-     *   MVM_JIT_BISECT=K:lo-hi  skip JIT for frames whose hash mod K is in
-     *                           [lo, hi] (they fall back to spesh bytecode)
-     *   MVM_JIT_ONLY=K:lo-hi    skip JIT for every frame EXCEPT those
+     *   MVM_JIT_BISECT=K:lo-hi     skip JIT for frames whose hash mod K is in
+     *                              [lo, hi] (fall back to spesh bytecode)
+     *   MVM_JIT_ONLY=K:lo-hi       skip JIT for every frame EXCEPT those
+     *   MVM_JIT_EXPR_ONLY=K:lo-hi  build expression trees ONLY for those
+     *                              frames (others compile lego-only)
      * MVM_JIT_BISECT_VERBOSE=1 prints each frame that is skipped/kept. */
     {
         const char *bisect = getenv("MVM_JIT_BISECT");
         const char *only   = getenv("MVM_JIT_ONLY");
         unsigned int k, lo, hi;
         const char *spec = bisect ? bisect : only;
-        if (spec && sscanf(spec, "%u:%u-%u", &k, &lo, &hi) == 3 && k
-                && sg->sf && sg->sf->body.name) {
-            char *nm = MVM_string_utf8_encode_C_string(tc, sg->sf->body.name);
-            char *cuuid = sg->sf->body.cuuid
-                ? MVM_string_utf8_encode_C_string(tc, sg->sf->body.cuuid) : NULL;
-            MVMuint32 hash = 2166136261u;
-            const char *p;
-            int in_range, skip;
-            for (p = nm ? nm : ""; *p; p++)
-                hash = (hash ^ (MVMuint8)*p) * 16777619u;
-            for (p = cuuid ? cuuid : ""; *p; p++)
-                hash = (hash ^ (MVMuint8)*p) * 16777619u;
-            in_range = hash % k >= lo && hash % k <= hi;
-            skip = bisect ? in_range : !in_range;
-            if (getenv("MVM_JIT_BISECT_VERBOSE") && (bisect ? in_range : !skip))
+        if (spec && sscanf(spec, "%u:%u-%u", &k, &lo, &hi) == 3 && k) {
+            MVMuint32 hash = frame_ident_hash(tc, sg);
+            int in_range = hash % k >= lo && hash % k <= hi;
+            int skip = bisect ? in_range : !in_range;
+            if (getenv("MVM_JIT_BISECT_VERBOSE") && (bisect ? in_range : !skip)) {
+                char *nm = sg->sf && sg->sf->body.name
+                    ? MVM_string_utf8_encode_C_string(tc, sg->sf->body.name) : NULL;
+                char *cuuid = sg->sf && sg->sf->body.cuuid
+                    ? MVM_string_utf8_encode_C_string(tc, sg->sf->body.cuuid) : NULL;
                 fprintf(stderr, "JIT-BISECT %s [%u/%u] '%s' (cuuid %s)\n",
                         skip ? "skip" : "keep", hash % k, k,
                         nm ? nm : "?", cuuid ? cuuid : "?");
-            MVM_free(nm);
-            MVM_free(cuuid);
+                MVM_free(nm);
+                MVM_free(cuuid);
+            }
             if (skip)
                 return NULL;
         }
@@ -4356,6 +4371,19 @@ MVMJitGraph * MVM_jit_try_make_graph(MVMThreadContext *tc, MVMSpeshGraph *sg) {
     graph->sg         = sg;
     graph->first_node = NULL;
     graph->last_node  = NULL;
+
+    /* MVM_JIT_EXPR_ONLY=K:lo-hi restricts expression-tree building to frames
+     * whose ident hash mod K falls in [lo, hi]; other frames compile
+     * lego-only. Bisection aid for expression-JIT miscompiles. */
+    graph->expr_allowed = 1;
+    {
+        const char *expr_only = getenv("MVM_JIT_EXPR_ONLY");
+        unsigned int k, lo, hi;
+        if (expr_only && sscanf(expr_only, "%u:%u-%u", &k, &lo, &hi) == 3 && k) {
+            MVMuint32 hash = frame_ident_hash(tc, sg);
+            graph->expr_allowed = hash % k >= lo && hash % k <= hi;
+        }
+    }
 
     /* Set initial instruction label offset */
     graph->obj_label_ofs = sg->num_bbs + 1;
