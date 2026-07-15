@@ -12,28 +12,36 @@
  * The register allocator never assigns values to x16. Safe to clobber. */
 #define SCRATCH 16
 
-/* Emit `add Rx(out), Rx(base), #imm` handling offsets > 4095 via x16. */
-static void arm64_add_imm(MVMThreadContext *tc, MVMJitCompiler *compiler,
-                          MVMint8 out, MVMint8 base, MVMint32 imm) {
-    MVMuint32 uimm = (MVMuint32)imm;
-    if (uimm <= 4095u) {
-        | add Rx(out), Rx(base), #imm
-    } else {
-        | movz x16, #(uimm & 0xffffu)
-        if (uimm > 0xffffu) {
-            | movk x16, #(uimm >> 16), lsl #16
-        }
-        | add Rx(out), Rx(base), x16
-    }
-}
-
-/* Emit `mov x16, #val` for an arbitrary 32-bit constant into x16. */
+/* Emit `mov x16, #val` for an arbitrary 32-bit constant into x16,
+ * SIGN-extending to 64 bits like x64's `mov r64, imm32` (movz/movk alone
+ * would zero-extend negatives — see const_reg). */
 static void arm64_mov_imm32_scratch(MVMThreadContext *tc, MVMJitCompiler *compiler,
                                     MVMint32 val) {
     MVMuint32 uval = (MVMuint32)val;
-    | movz x16, #(uval & 0xffffu)
-    if (uval > 0xffffu) {
-        | movk x16, #(uval >> 16), lsl #16
+    if (val < 0) {
+        | movn x16, #((~uval) & 0xffffu)
+        if (((uval >> 16) & 0xffffu) != 0xffffu) {
+            | movk x16, #((uval >> 16) & 0xffffu), lsl #16
+        }
+    } else {
+        | movz x16, #(uval & 0xffffu)
+        if (uval > 0xffffu) {
+            | movk x16, #(uval >> 16), lsl #16
+        }
+    }
+}
+
+/* Emit `add Rx(out), Rx(base), #imm` (imm signed) handling magnitudes > 4095
+ * via x16. */
+static void arm64_add_imm(MVMThreadContext *tc, MVMJitCompiler *compiler,
+                          MVMint8 out, MVMint8 base, MVMint32 imm) {
+    if (imm >= 0 && imm <= 4095) {
+        | add Rx(out), Rx(base), #imm
+    } else if (imm < 0 && imm >= -4095) {
+        | sub Rx(out), Rx(base), #(-imm)
+    } else {
+        arm64_mov_imm32_scratch(tc, compiler, imm);
+        | add Rx(out), Rx(base), x16
     }
 }
 
@@ -86,9 +94,21 @@ MVM_JIT_TILE_DECL(const_reg) {
     MVMint8 out    = tile->values[0];
     MVMint32 val   = tile->args[0];
     MVMuint32 uval = (MVMuint32)val;
-    | movz Rx(out), #(uval & 0xffffu)
-    if (uval > 0xffffu) {
-        | movk Rx(out), #(uval >> 16), lsl #16
+    if (val < 0) {
+        /* Negative constants must SIGN-extend to 64 bits (x64 got this for
+         * free from `mov reg, imm32`; movz/movk zero-extend, which turned
+         * -1 into 0xFFFFFFFF and broke e.g. regex -1 position sentinels).
+         * MOVN sets reg = ~imm16 (upper bits all ones); MOVK then patches
+         * bits 16-31 unless they are already all ones. */
+        | movn Rx(out), #((~uval) & 0xffffu)
+        if (((uval >> 16) & 0xffffu) != 0xffffu) {
+            | movk Rx(out), #((uval >> 16) & 0xffffu), lsl #16
+        }
+    } else {
+        | movz Rx(out), #(uval & 0xffffu)
+        if (uval > 0xffffu) {
+            | movk Rx(out), #(uval >> 16), lsl #16
+        }
     }
 }
 
