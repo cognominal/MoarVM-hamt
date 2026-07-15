@@ -17,7 +17,7 @@
 #endif
 #line 7 "src/jit/arm64/emit.dasc"
 //|.actionlist actions
-static const unsigned int actions[4738] = {
+static const unsigned int actions[4751] = {
 0x910002a0,
 0x00110000,
 0x000c0000,
@@ -4733,8 +4733,15 @@ static const unsigned int actions[4738] = {
 0x14000000,
 0x00050014,
 0x00000000,
-0xd63f0000,
-0x00110005,
+0xaa0003f0,
+0x00110010,
+0x10000011,
+0x00052009,
+0xf90017f1,
+0xd63f0200,
+0xf94017f1,
+0xd61f0220,
+0x00060013,
 0x00000000,
 0x00010001,
 0x0006000f,
@@ -4754,7 +4761,13 @@ static const unsigned int actions[4738] = {
 0xf8400010,
 0x00110005,
 0x000f0003,
+0x10000011,
+0x00052009,
+0xf90017f1,
 0xd63f0200,
+0xf94017f1,
+0xd61f0220,
+0x00060013,
 0x00000000
 };
 
@@ -10812,21 +10825,26 @@ MVM_JIT_TILE_DECL(branch_label) {
 
 /* ---- Calls from expression trees ---------------------------------------- */
 
+/* All call tiles must go through callp/callf so the jit_return_address
+ * slot at [sp,#40] stays current across the call: a bare blr gives frame
+ * walkers (GC, dynlex, handler search) a stale JIT position and silently
+ * drops deopt redirects — the same bug class as the lego-JIT callf fix. */
 MVM_JIT_TILE_DECL(call) {
     MVMint8 reg = tile->values[1];
-    //| blr Rx(reg)
+    //| mov FUNCTION, Rx(reg)
+    //| callf
     dasm_put(Dst, 4715, (reg));
-#line 721 "src/jit/arm64/tiles.dasc"
+#line 726 "src/jit/arm64/tiles.dasc"
     arm64_move_tile_call_value(tc, compiler, tile);
 }
 
 MVM_JIT_TILE_DECL(call_func) {
     uintptr_t ptr = tree->constants[tile->args[0]].u;
     //| callp ptr
-    dasm_put(Dst, 4718);
-    dasm_put(Dst, 4719, (unsigned int)((uintptr_t)(ptr)), (unsigned int)((unsigned long long)((uintptr_t)(ptr))>>32));
-    dasm_put(Dst, 4723);
-#line 727 "src/jit/arm64/tiles.dasc"
+    dasm_put(Dst, 4725);
+    dasm_put(Dst, 4726, (unsigned int)((uintptr_t)(ptr)), (unsigned int)((unsigned long long)((uintptr_t)(ptr))>>32));
+    dasm_put(Dst, 4730);
+#line 732 "src/jit/arm64/tiles.dasc"
     arm64_move_tile_call_value(tc, compiler, tile);
 }
 
@@ -10834,8 +10852,8 @@ MVM_JIT_TILE_DECL(call_addr) {
     MVMint8 reg  = tile->values[1];
     MVMint32 ofs = tile->args[0];
     //| ldr FUNCTION, [Rx(reg), #ofs]
-    //| blr FUNCTION
-    dasm_put(Dst, 4733, (reg), ofs);
-#line 735 "src/jit/arm64/tiles.dasc"
+    //| callf
+    dasm_put(Dst, 4740, (reg), ofs);
+#line 740 "src/jit/arm64/tiles.dasc"
     arm64_move_tile_call_value(tc, compiler, tile);
 }

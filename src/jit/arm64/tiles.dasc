@@ -715,9 +715,14 @@ MVM_JIT_TILE_DECL(branch_label) {
 
 /* ---- Calls from expression trees ---------------------------------------- */
 
+/* All call tiles must go through callp/callf so the jit_return_address
+ * slot at [sp,#40] stays current across the call: a bare blr gives frame
+ * walkers (GC, dynlex, handler search) a stale JIT position and silently
+ * drops deopt redirects — the same bug class as the lego-JIT callf fix. */
 MVM_JIT_TILE_DECL(call) {
     MVMint8 reg = tile->values[1];
-    | blr Rx(reg)
+    | mov FUNCTION, Rx(reg)
+    | callf
     arm64_move_tile_call_value(tc, compiler, tile);
 }
 
@@ -731,6 +736,6 @@ MVM_JIT_TILE_DECL(call_addr) {
     MVMint8 reg  = tile->values[1];
     MVMint32 ofs = tile->args[0];
     | ldr FUNCTION, [Rx(reg), #ofs]
-    | blr FUNCTION
+    | callf
     arm64_move_tile_call_value(tc, compiler, tile);
 }
