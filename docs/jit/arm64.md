@@ -215,27 +215,43 @@ Outstanding: Blin (ecosystem tests), and verifying x64 is not regressed
 
 ## Milestone 8 — Tuning and PR (IN PROGRESS)
 
-Measured so far (Apple Silicon, CORE.setting compile, 3 runs each):
+**Important:** the expression JIT is OFF by default — it requires
+`MVM_JIT_EXPR_ENABLE=1`. (`MVM_JIT_EXPR_DISABLE` does not exist; an
+earlier version of this section unknowingly compared lego against lego.)
 
-- Default (lego + expression JIT): 29s, 29s, 29s.
-- `MVM_JIT_EXPR_DISABLE=1` (lego only): 29s, 29s, 30s.
-- `MVM_JIT_DISABLE=1` (interpreter + spesh bytecode): 35s, 37s, 35s.
+Measured on Apple Silicon, 3 runs each, on the `jit-expr` branch after
+the expression-JIT correctness fixes:
 
-So the JIT is worth ~20% on this workload; the expression JIT's
-contribution is currently negligible on it (within noise) — a future
-tuning target, not a blocker.
+| workload | no JIT | lego JIT | lego + expr JIT |
+|----------|--------|----------|-----------------|
+| CORE.setting compile (call-dense) | 35.3s | **29.3s** | 30.7s |
+| hot native-int loop, 50M iters    | 1.09s | 0.45s    | **0.37s** |
 
-- JIT coverage: 21 frame bails out of 9,046 specializations (99.8%);
-  the bails are all rare startup meta-ops (`settypehll`, `getenvhash`,
-  `freshcoderef`, …) — no high-value emitter is missing.
+So: the lego JIT is worth ~17% on the compiler workload and ~2.4x on
+numeric code; the expression JIT adds ~18% on loop/numeric code but
+costs ~5% on call-dense code (tree building/tiling/regalloc for ~92k
+trees at spesh time, with little codegen upside where every call flushes
+values anyway). The indicated next step is **selective enablement**:
+expr-compile only frames whose spesh graph is loop-heavy (e.g. OSR'd
+frames), turning the tradeoff into a strict win.
+
+- Lego JIT coverage: 21 frame bails out of 9,046 specializations
+  (99.8%); all rare startup meta-ops — no high-value emitter missing.
+- Expression JIT coverage (with `MVM_JIT_EXPR_ENABLE=1`): 90.6% of
+  instructions lowered via trees on the CORE.setting build, mean tree
+  2.66 roots (`MVM_JIT_EXPR_STATS`). Correctness: full spectest
+  (138,603 tests) green with expr enabled.
 - Rebased onto `main` (2026.06.1); clean rebase, full re-verification
-  (CORE build + Rakudo `make test`) green on the new base.
+  green on the new base.
 
 Remaining:
 
+- Selective (per-frame) expression-JIT enablement.
 - Compare against x64 baselines; investigate anomalies.
 - Blin ecosystem run.
 - Open GitHub Pull Request (notifies MoarVM team automatically).
+- Upstream separately (affect x64 today): the `newmixintype` template
+  fix, the `branch_label` GC sync point, the pid-file `GCDEBUG_LOG`.
 
 ---
 
