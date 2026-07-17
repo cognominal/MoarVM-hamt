@@ -4248,16 +4248,29 @@ static MVMint32 consume_bb(MVMThreadContext *tc, MVMJitGraph *jg,
         }
     }
 
-    /* Try to create an expression tree */
-    if (tc->instance->jit_expr_enabled && jg->expr_allowed &&
+    /* Whether expression trees may be built for this BB */
+    MVMint32 expr_here = tc->instance->jit_expr_enabled && jg->expr_allowed &&
         iter->bb->idx >= jg->expr_bb_lo && iter->bb->idx <= jg->expr_bb_hi &&
         (tc->instance->jit_expr_last_frame < 0 ||
          tc->instance->spesh_produced < tc->instance->jit_expr_last_frame ||
          (tc->instance->spesh_produced == tc->instance->jit_expr_last_frame &&
           (tc->instance->jit_expr_last_bb < 0 ||
-           iter->bb->idx <= tc->instance->jit_expr_last_bb)))) {
+           iter->bb->idx <= tc->instance->jit_expr_last_bb)));
 
-        while (iter->ins) {
+    /* With MVM_JIT_EXPR_RETRY=1, alternate between building expression trees
+     * and lego-compiling the single instruction that blocked the tree, so one
+     * untemplated op no longer forces the whole rest of the basic block onto
+     * the lego path. Off by default: mid-BB tree resumption currently
+     * miscompiles (seam bug under investigation — reproducer: NQPClassHOW
+     * new_type BBs 6-14 under MVM_SPESH_BLOCKING+NODELAY). Without it, a
+     * tree is only attempted at the start of the BB, as upstream does. */
+    MVMint32 expr_retry = 0;
+    {
+        const char *retry = getenv("MVM_JIT_EXPR_RETRY");
+        expr_retry = retry && retry[0];
+    }
+    while (iter->ins) {
+        if (expr_here) {
             /* consumes iterator */
             tree = MVM_jit_expr_tree_build(tc, jg, iter);
             if (tree != NULL) {
@@ -4280,20 +4293,13 @@ static MVMint32 consume_bb(MVMThreadContext *tc, MVMJitGraph *jg,
                     bb_has_tree = 1;
                 }
             }
-            if (iter->ins) {
-                /* something we can't compile yet, or simply an empty tree */
+            if (!iter->ins)
                 break;
-            }
+            if (!expr_retry)
+                expr_here = 0;
         }
-    }
-    if (stats) {
-        stats->bbs_total++;
-        if (bb_has_tree)
-            stats->bbs_with_tree++;
-    }
-
-    /* Try to consume the (rest of the) basic block per instruction */
-    while (iter->ins) {
+        /* Lego-compile the instruction the tree could not include (or, with
+         * the expression JIT off, every instruction) */
         before_ins(tc, jg, iter, iter->ins);
         if(!consume_ins(tc, jg, iter, iter->ins))
             return 0;
@@ -4301,6 +4307,11 @@ static MVMint32 consume_bb(MVMThreadContext *tc, MVMJitGraph *jg,
         if (stats)
             stats->ins_lego++;
         MVM_spesh_iterator_next_ins(tc, iter);
+    }
+    if (stats) {
+        stats->bbs_total++;
+        if (bb_has_tree)
+            stats->bbs_with_tree++;
     }
 
     return 1;

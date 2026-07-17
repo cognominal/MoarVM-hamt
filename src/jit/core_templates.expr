@@ -2955,6 +2955,25 @@
 (template: sp_p6oget_n (load_num (add (^p6obody $1) $2) num_sz))
 (template: sp_p6oget_s (load (add (^p6obody $1) $2) ptr_sz))
 
+
+# Specialized lexical read with known depth and no vivification (the operand
+# loader emits the outer-chain walk, exactly as for plain getlex).
+(template: sp_getlex_ins (copy $1))
+
+# Get object attribute at known offset, vivifying from a spesh-slot type
+# object when null. The vivify path stores the type object back (with write
+# barrier) but does not allocate, so cached values stay valid. sp_getvc_o is
+# NOT templated: its vivify path clones (can GC), requiring a re-fetch that
+# a tree would unsafely cache over.
+(template: sp_getvt_o
+  (let: (($addr (add $1 $2)))
+    (let: (($val (load $addr ptr_sz)))
+      (if (nz $val)
+          $val
+          (let: (($vivify (^spesh_slot_value $3)))
+            (do (dov (^store_write_barrier! $1 $addr $vivify))
+                (copy $vivify)))))))
+
 (template: sp_p6obind_o
   (^store_write_barrier! $0 (add (^p6obody $0) $1) $2))
 
@@ -2969,7 +2988,13 @@
       $obj
       (^vmnull))))
 
-#(template: sp_get_i64 (load (add $1 $2) int_sz))
+(template: sp_get_i64 (load (add $1 $2) int_sz))
+(template: sp_get_n   (load_num (add $1 $2) num_sz))
+# sp_get_s is NOT templated: with it enabled, trees interact with
+# inline-region trees to produce a crash (repro: NQPClassHOW new_type
+# spec 2, BBs 6-14, under MVM_SPESH_BLOCKING+NODELAY). Upstream's own
+# commented-out sp_get_i* templates below suggest known trouble here.
+#(template: sp_get_s   (load (add $1 $2) ptr_sz))
 #(template: sp_get_i32 (load (add $1 $2) 4))
 #(template: sp_get_i16 (load (add $1 $2) 2))
 #(template: sp_get_i8  (load (add $1 $2) 1))
