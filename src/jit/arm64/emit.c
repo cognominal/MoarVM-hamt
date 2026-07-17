@@ -17,7 +17,7 @@
 #endif
 #line 7 "src/jit/arm64/emit.dasc"
 //|.actionlist actions
-static const unsigned int actions[4751] = {
+static const unsigned int actions[4772] = {
 0x910002a0,
 0x00110000,
 0x000c0000,
@@ -4726,6 +4726,27 @@ static const unsigned int actions[4751] = {
 0x10000000,
 0x00110000,
 0x00072000,
+0x00000000,
+0xf8400269,
+0x000f0003,
+0xb4000009,
+0x00050801,
+0xaa1303e0,
+0x00010001,
+0x0006000f,
+0x00100000,
+0x00100000,
+0x00010000,
+0x58000010,
+0x0005080f,
+0x10000011,
+0x00052009,
+0xf90017f1,
+0xd63f0200,
+0xf94017f1,
+0xd61f0220,
+0x00060013,
+0x0006000b,
 0x00000000,
 0x14000000,
 0x00070000,
@@ -10812,14 +10833,28 @@ MVM_JIT_TILE_DECL(label) {
 
 MVM_JIT_TILE_DECL(branch_label) {
     MVMint32 label = tile->args[0];
+    /* Branches to graph (basic-block) labels take over from lego
+     * block-branches, which are mandatory GC sync points: without the poll, a
+     * loop whose back-edge is tree-compiled never notices a GC interrupt, and
+     * the GC handshake deadlocks on it (observed as a spawned pool worker
+     * spinning through hot expr-compiled code while the coordinator waits
+     * forever). Tree-internal labels (>= the graph's label count) are forward
+     * branches within one tree and need no poll. */
+    if (label < 0 || label < compiler->graph->num_labels) {
+        //| gc_sync_point
+        dasm_put(Dst, 4709, Dt1(->gc_status));
+        dasm_put(Dst, 4715, (unsigned int)((uintptr_t)(&MVM_gc_enter_from_interrupt)), (unsigned int)((unsigned long long)((uintptr_t)(&MVM_gc_enter_from_interrupt))>>32));
+        dasm_put(Dst, 4719);
+#line 718 "src/jit/arm64/tiles.dasc"
+    }
     if (label >= 0) {
         //| b =>(label)
-        dasm_put(Dst, 4709, (label));
-#line 711 "src/jit/arm64/tiles.dasc"
+        dasm_put(Dst, 4730, (label));
+#line 721 "src/jit/arm64/tiles.dasc"
     } else {
         //| b ->exit
-        dasm_put(Dst, 4712);
-#line 713 "src/jit/arm64/tiles.dasc"
+        dasm_put(Dst, 4733);
+#line 723 "src/jit/arm64/tiles.dasc"
     }
 }
 
@@ -10833,18 +10868,18 @@ MVM_JIT_TILE_DECL(call) {
     MVMint8 reg = tile->values[1];
     //| mov FUNCTION, Rx(reg)
     //| callf
-    dasm_put(Dst, 4715, (reg));
-#line 726 "src/jit/arm64/tiles.dasc"
+    dasm_put(Dst, 4736, (reg));
+#line 736 "src/jit/arm64/tiles.dasc"
     arm64_move_tile_call_value(tc, compiler, tile);
 }
 
 MVM_JIT_TILE_DECL(call_func) {
     uintptr_t ptr = tree->constants[tile->args[0]].u;
     //| callp ptr
-    dasm_put(Dst, 4725);
-    dasm_put(Dst, 4726, (unsigned int)((uintptr_t)(ptr)), (unsigned int)((unsigned long long)((uintptr_t)(ptr))>>32));
-    dasm_put(Dst, 4730);
-#line 732 "src/jit/arm64/tiles.dasc"
+    dasm_put(Dst, 4746);
+    dasm_put(Dst, 4747, (unsigned int)((uintptr_t)(ptr)), (unsigned int)((unsigned long long)((uintptr_t)(ptr))>>32));
+    dasm_put(Dst, 4751);
+#line 742 "src/jit/arm64/tiles.dasc"
     arm64_move_tile_call_value(tc, compiler, tile);
 }
 
@@ -10853,7 +10888,7 @@ MVM_JIT_TILE_DECL(call_addr) {
     MVMint32 ofs = tile->args[0];
     //| ldr FUNCTION, [Rx(reg), #ofs]
     //| callf
-    dasm_put(Dst, 4740, (reg), ofs);
-#line 740 "src/jit/arm64/tiles.dasc"
+    dasm_put(Dst, 4761, (reg), ofs);
+#line 750 "src/jit/arm64/tiles.dasc"
     arm64_move_tile_call_value(tc, compiler, tile);
 }

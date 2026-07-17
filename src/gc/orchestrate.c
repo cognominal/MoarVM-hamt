@@ -1,3 +1,4 @@
+#include <unistd.h>
 #include "moar.h"
 #include "platform/malloc_trim.h"
 

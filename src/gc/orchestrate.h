@@ -1,3 +1,4 @@
+#include <unistd.h>
 void MVM_gc_enter_from_allocator(MVMThreadContext *tc);
 void MVM_gc_enter_from_interrupt(MVMThreadContext *tc);
 MVM_PUBLIC void MVM_gc_mark_thread_blocked(MVMThreadContext *tc);
@@ -51,6 +52,13 @@ typedef enum {
     ((MVM_GC_DEBUG_LOG_FLAGS) & (flags))
 
 # define GCDEBUG_LOG(tc, flags, msg, ...) \
-    if (MVM_GC_DEBUG_ENABLED(flags)) \
-        printf((msg), (tc)->thread_id, \
-            (int)MVM_load(&(tc)->instance->gc_seq_number) , ##__VA_ARGS__)
+    if (MVM_GC_DEBUG_ENABLED(flags)) { \
+        char _gcdbg_p[64]; FILE *_gcdbg_f; \
+        snprintf(_gcdbg_p, sizeof _gcdbg_p, "/tmp/gcdbg.%d", (int)getpid()); \
+        _gcdbg_f = fopen(_gcdbg_p, "a"); \
+        if (_gcdbg_f) { \
+            fprintf(_gcdbg_f, (msg), (tc)->thread_id, \
+                (int)MVM_load(&(tc)->instance->gc_seq_number) , ##__VA_ARGS__); \
+            fclose(_gcdbg_f); \
+        } \
+    }

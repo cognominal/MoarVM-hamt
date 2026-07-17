@@ -4392,35 +4392,46 @@ MVMJitGraph * MVM_jit_try_make_graph(MVMThreadContext *tc, MVMSpeshGraph *sg) {
     graph->first_node = NULL;
     graph->last_node  = NULL;
 
-    /* MVM_JIT_EXPR_ONLY=K:lo-hi[:bblo-bbhi[,bblo-bbhi...]] restricts
-     * expression-tree building to frames whose ident hash mod K falls in
-     * [lo, hi] (and, optionally, to basic blocks whose idx falls in any of
-     * the given ranges); everything else compiles lego-only. Bisection aid
-     * for expression-JIT miscompiles. */
+    /* MVM_JIT_EXPR_ONLY=K:lo-hi[:bblo-bbhi[,...]][;K:lo-hi[:...]...]
+     * restricts expression-tree building to frames whose ident hash mod K
+     * falls in [lo, hi] for ANY of the semicolon-separated specs (and,
+     * optionally, to basic blocks whose idx falls in any of the given ranges
+     * of the matching spec); everything else compiles lego-only. Bisection
+     * aid for expression-JIT miscompiles. */
     graph->expr_allowed    = 1;
     graph->expr_bb_nranges = 0;
     {
         const char *expr_only = getenv("MVM_JIT_EXPR_ONLY");
-        unsigned int k, lo, hi;
-        if (expr_only && sscanf(expr_only, "%u:%u-%u", &k, &lo, &hi) == 3 && k) {
-            const char *p;
+        if (expr_only && expr_only[0]) {
+            const char *spec = expr_only;
             MVMuint32 hash = frame_ident_hash(tc, sg);
-            graph->expr_allowed = hash % k >= lo && hash % k <= hi;
-            p = strchr(expr_only, ':');
-            p = p ? strchr(p + 1, ':') : NULL;
-            if (p && graph->expr_allowed) {
-                p++;
-                while (*p && graph->expr_bb_nranges + 2 <= 16) {
-                    unsigned int bblo, bbhi;
-                    int consumed;
-                    if (sscanf(p, "%u-%u%n", &bblo, &bbhi, &consumed) < 2)
-                        break;
-                    graph->expr_bb_ranges[graph->expr_bb_nranges++] = bblo;
-                    graph->expr_bb_ranges[graph->expr_bb_nranges++] = bbhi;
-                    p += consumed;
-                    if (*p == ',')
+            graph->expr_allowed = 0;
+            while (spec && *spec) {
+                unsigned int k, lo, hi;
+                const char *next = strchr(spec, ';');
+                if (sscanf(spec, "%u:%u-%u", &k, &lo, &hi) == 3 && k
+                        && hash % k >= lo && hash % k <= hi) {
+                    const char *p = strchr(spec, ':');
+                    p = p ? strchr(p + 1, ':') : NULL;
+                    graph->expr_allowed = 1;
+                    graph->expr_bb_nranges = 0;
+                    if (p && (!next || p < next)) {
                         p++;
+                        while (*p && graph->expr_bb_nranges + 2 <= 16) {
+                            unsigned int bblo, bbhi;
+                            int consumed;
+                            if (sscanf(p, "%u-%u%n", &bblo, &bbhi, &consumed) < 2)
+                                break;
+                            graph->expr_bb_ranges[graph->expr_bb_nranges++] = bblo;
+                            graph->expr_bb_ranges[graph->expr_bb_nranges++] = bbhi;
+                            p += consumed;
+                            if (*p == ',')
+                                p++;
+                        }
+                    }
+                    break;
                 }
+                spec = next ? next + 1 : NULL;
             }
         }
     }

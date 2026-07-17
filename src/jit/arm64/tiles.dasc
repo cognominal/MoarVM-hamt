@@ -706,6 +706,16 @@ MVM_JIT_TILE_DECL(label) {
 
 MVM_JIT_TILE_DECL(branch_label) {
     MVMint32 label = tile->args[0];
+    /* Branches to graph (basic-block) labels take over from lego
+     * block-branches, which are mandatory GC sync points: without the poll, a
+     * loop whose back-edge is tree-compiled never notices a GC interrupt, and
+     * the GC handshake deadlocks on it (observed as a spawned pool worker
+     * spinning through hot expr-compiled code while the coordinator waits
+     * forever). Tree-internal labels (>= the graph's label count) are forward
+     * branches within one tree and need no poll. */
+    if (label < 0 || label < compiler->graph->num_labels) {
+        | gc_sync_point
+    }
     if (label >= 0) {
         | b =>(label)
     } else {
