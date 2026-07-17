@@ -4249,25 +4249,33 @@ static MVMint32 consume_bb(MVMThreadContext *tc, MVMJitGraph *jg,
     }
 
     /* Whether expression trees may be built for this BB */
+    MVMint32 bb_in_ranges = 1;
+    if (jg->expr_bb_nranges) {
+        MVMint32 ri;
+        bb_in_ranges = 0;
+        for (ri = 0; ri < jg->expr_bb_nranges; ri += 2)
+            if (iter->bb->idx >= jg->expr_bb_ranges[ri] &&
+                    iter->bb->idx <= jg->expr_bb_ranges[ri + 1])
+                bb_in_ranges = 1;
+    }
     MVMint32 expr_here = tc->instance->jit_expr_enabled && jg->expr_allowed &&
-        iter->bb->idx >= jg->expr_bb_lo && iter->bb->idx <= jg->expr_bb_hi &&
+        bb_in_ranges &&
         (tc->instance->jit_expr_last_frame < 0 ||
          tc->instance->spesh_produced < tc->instance->jit_expr_last_frame ||
          (tc->instance->spesh_produced == tc->instance->jit_expr_last_frame &&
           (tc->instance->jit_expr_last_bb < 0 ||
            iter->bb->idx <= tc->instance->jit_expr_last_bb)));
 
-    /* With MVM_JIT_EXPR_RETRY=1, alternate between building expression trees
-     * and lego-compiling the single instruction that blocked the tree, so one
-     * untemplated op no longer forces the whole rest of the basic block onto
-     * the lego path. Off by default: mid-BB tree resumption currently
-     * miscompiles (seam bug under investigation — reproducer: NQPClassHOW
-     * new_type BBs 6-14 under MVM_SPESH_BLOCKING+NODELAY). Without it, a
-     * tree is only attempted at the start of the BB, as upstream does. */
-    MVMint32 expr_retry = 0;
+    /* Alternate between building expression trees and lego-compiling the
+     * single instruction that blocked the tree, so one untemplated op no
+     * longer forces the whole rest of the basic block onto the lego path.
+     * MVM_JIT_EXPR_RETRY=0 restores the upstream behaviour (tree attempted
+     * only at the start of each BB) as a debugging aid. */
+    MVMint32 expr_retry = 1;
     {
         const char *retry = getenv("MVM_JIT_EXPR_RETRY");
-        expr_retry = retry && retry[0];
+        if (retry && retry[0])
+            expr_retry = strcmp(retry, "0") != 0;
     }
     while (iter->ins) {
         if (expr_here) {
@@ -4384,25 +4392,35 @@ MVMJitGraph * MVM_jit_try_make_graph(MVMThreadContext *tc, MVMSpeshGraph *sg) {
     graph->first_node = NULL;
     graph->last_node  = NULL;
 
-    /* MVM_JIT_EXPR_ONLY=K:lo-hi[:bblo-bbhi] restricts expression-tree
-     * building to frames whose ident hash mod K falls in [lo, hi] (and,
-     * optionally, to basic blocks with idx in [bblo, bbhi] within them);
-     * everything else compiles lego-only. Bisection aid for expression-JIT
-     * miscompiles. */
-    graph->expr_allowed = 1;
-    graph->expr_bb_lo   = 0;
-    graph->expr_bb_hi   = 0x7fffffff;
+    /* MVM_JIT_EXPR_ONLY=K:lo-hi[:bblo-bbhi[,bblo-bbhi...]] restricts
+     * expression-tree building to frames whose ident hash mod K falls in
+     * [lo, hi] (and, optionally, to basic blocks whose idx falls in any of
+     * the given ranges); everything else compiles lego-only. Bisection aid
+     * for expression-JIT miscompiles. */
+    graph->expr_allowed    = 1;
+    graph->expr_bb_nranges = 0;
     {
         const char *expr_only = getenv("MVM_JIT_EXPR_ONLY");
-        unsigned int k, lo, hi, bblo, bbhi;
-        int fields;
-        if (expr_only && (fields = sscanf(expr_only, "%u:%u-%u:%u-%u",
-                &k, &lo, &hi, &bblo, &bbhi)) >= 3 && k) {
+        unsigned int k, lo, hi;
+        if (expr_only && sscanf(expr_only, "%u:%u-%u", &k, &lo, &hi) == 3 && k) {
+            const char *p;
             MVMuint32 hash = frame_ident_hash(tc, sg);
             graph->expr_allowed = hash % k >= lo && hash % k <= hi;
-            if (fields == 5 && graph->expr_allowed) {
-                graph->expr_bb_lo = bblo;
-                graph->expr_bb_hi = bbhi;
+            p = strchr(expr_only, ':');
+            p = p ? strchr(p + 1, ':') : NULL;
+            if (p && graph->expr_allowed) {
+                p++;
+                while (*p && graph->expr_bb_nranges + 2 <= 16) {
+                    unsigned int bblo, bbhi;
+                    int consumed;
+                    if (sscanf(p, "%u-%u%n", &bblo, &bbhi, &consumed) < 2)
+                        break;
+                    graph->expr_bb_ranges[graph->expr_bb_nranges++] = bblo;
+                    graph->expr_bb_ranges[graph->expr_bb_nranges++] = bbhi;
+                    p += consumed;
+                    if (*p == ',')
+                        p++;
+                }
             }
         }
     }

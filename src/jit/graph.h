@@ -42,10 +42,10 @@ struct MVMJitGraph {
 
     /* Whether expression-tree building is allowed for this frame (used by
      * the MVM_JIT_EXPR_ONLY bisection aid; 1 unless restricted), and the
-     * BB index range it is allowed in (defaults to everything) */
+     * BB index ranges it is allowed in (nranges == 0: everything) */
     MVMuint8       expr_allowed;
-    MVMint32       expr_bb_lo;
-    MVMint32       expr_bb_hi;
+    MVMint32       expr_bb_ranges[16];
+    MVMint32       expr_bb_nranges;
 
     /* resultant JIT code is supports 'invokish' etc? */
     MVMuint8       no_trampoline;

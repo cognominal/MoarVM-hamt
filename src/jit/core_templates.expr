@@ -1843,6 +1843,10 @@
       (carg $1 int)
       (carg $2 int)) ptr_sz))
 
+# NB: is_mixin_type lives on the STable; the previous version stored it
+# relative to the type object itself (writing past the object into the next
+# collectable) and returned (load $type) — header.sc_forward_u, zero for a
+# fresh object — instead of the type object.
 (template: newmixintype
   (let: (($repr (call (^func &MVM_repr_get_by_name)
                   (arglist
@@ -1853,8 +1857,8 @@
                       (carg (tc) ptr)
                       (carg $1   ptr)) ptr_sz)))
       (do
-        (^setf $type MVMSTable is_mixin_type (const 1 int_sz))
-        (load $type ptr_sz)))))
+        (^setf (^stable $type) MVMSTable is_mixin_type (const 1 int_sz))
+        (copy $type)))))
 
 (template: iscompunit
   (flagval
@@ -2994,7 +2998,7 @@
 # inline-region trees to produce a crash (repro: NQPClassHOW new_type
 # spec 2, BBs 6-14, under MVM_SPESH_BLOCKING+NODELAY). Upstream's own
 # commented-out sp_get_i* templates below suggest known trouble here.
-#(template: sp_get_s   (load (add $1 $2) ptr_sz))
+(template: sp_get_s   (load (add $1 $2) ptr_sz))
 #(template: sp_get_i32 (load (add $1 $2) 4))
 #(template: sp_get_i16 (load (add $1 $2) 2))
 #(template: sp_get_i8  (load (add $1 $2) 1))
